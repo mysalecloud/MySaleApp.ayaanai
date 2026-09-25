@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/MySale.AI.Domain/MySale.AI.Domain.csproj" />
+    <Project Path="src/MySale.AI.Application/MySale.AI.Application.csproj" />
+    <Project Path="src/MySale.AI.Infrastructure/MySale.AI.Infrastructure.csproj" />
+    <Project Path="src/MySale.AI.Api/MySale.AI.Api.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/MySale.AI.Tests/MySale.AI.Tests.csproj" />
+  </Folder>
+</Solution>

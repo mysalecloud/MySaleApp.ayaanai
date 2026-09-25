@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <UserSecretsId>mysale-ai-agent-api</UserSecretsId>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\MySale.AI.Infrastructure\MySale.AI.Infrastructure.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,277 @@
+using System.Text.RegularExpressions;
+using MongoDB.Bson;
+using MongoDB.Driver;
+using MySale.AI.Application.Abstractions;
+using MySale.AI.Domain;
+
+namespace MySale.AI.Infrastructure.Persistence;
+
+public sealed class UserRepository : IUserRepository
+{
+    private readonly SystemDbContext _db;
+    public UserRepository(SystemDbContext db) => _db = db;
+
+    public async Task<AppUser?> FindByUserNameAsync(string userName, CancellationToken ct)
+        => await _db.Users.Find(u => u.UserName == userName).FirstOrDefaultAsync(ct);
+
+    public async Task<AppUser?> GetAsync(string id, CancellationToken ct)
+        => SystemDbContext.IsObjectId(id) ? await _db.Users.Find(u => u.Id == id).FirstOrDefaultAsync(ct) : null;
+
+    public Task<List<AppUser>> ListAsync(CancellationToken ct)
+        => _db.Users.Find(FilterDefinition<AppUser>.Empty).SortBy(u => u.UserName).ToListAsync(ct);
+
+    public async Task UpsertAsync(AppUser user, CancellationToken ct)
+    {
+        var existing = await FindByUserNameAsync(user.UserName, ct);
+        if (existing is null)
+        {
+            await _db.Users.InsertOneAsync(user, cancellationToken: ct);
+        }
+        else
+        {
+            user.Id = existing.Id;
+            await _db.Users.ReplaceOneAsync(u => u.Id == existing.Id, user, cancellationToken: ct);
+        }
+    }
+
+    public Task UpdateLastLoginAsync(string id, DateTime at, CancellationToken ct)
+        => _db.Users.UpdateOneAsync(u => u.Id == id, Builders<AppUser>.Update.Set(u => u.LastLoginAt, at), cancellationToken: ct);
+}
+
+public sealed class ProviderRepository : IProviderRepository
+{
+    private readonly SystemDbContext _db;
+    public ProviderRepository(SystemDbContext db) => _db = db;
+
+    public Task<List<ProviderConfig>> ListAsync(CancellationToken ct)
+        => _db.Providers.Find(FilterDefinition<ProviderConfig>.Empty).SortBy(p => p.Name).ToListAsync(ct);
+
+    public async Task<ProviderConfig?> GetAsync(string id, CancellationToken ct)
+        => SystemDbContext.IsObjectId(id) ? await _db.Providers.Find(p => p.Id == id).FirstOrDefaultAsync(ct) : null;
+
+    public Task InsertAsync(ProviderConfig config, CancellationToken ct)
+        => _db.Providers.InsertOneAsync(config, cancellationToken: ct);
+
+    public Task UpdateAsync(ProviderConfig config, CancellationToken ct)
+        => _db.Providers.ReplaceOneAsync(p => p.Id == config.Id, config, cancellationToken: ct);
+
+    public Task DeleteAsync(string id, CancellationToken ct)
+        => _db.Providers.DeleteOneAsync(p => p.Id == id, ct);
+
+    public Task ClearDefaultAsync(string exceptId, CancellationToken ct)
+        => _db.Providers.UpdateManyAsync(p => p.Id != exceptId && p.IsDefault,
+            Builders<ProviderConfig>.Update.Set(p => p.IsDefault, false), cancellationToken: ct);
+
+    public Task UpdateTestStatusAsync(string id, ProviderStatus status, string? message, DateTime at, CancellationToken ct)
+        => _db.Providers.UpdateOneAsync(p => p.Id == id, Builders<ProviderConfig>.Update
+            .Set(p => p.LastTestStatus, status)
+            .Set(p => p.LastTestMessage, message)
+            .Set(p => p.LastTestedAt, at), cancellationToken: ct);
+}
+
+public sealed class ConversationRepository : IConversationRepository
+{
+    private readonly SystemDbContext _db;
+    public ConversationRepository(SystemDbContext db) => _db = db;
+
+    public Task<List<Conversation>> ListAsync(string userId, string companyId, string? search, bool? archived, int limit, CancellationToken ct)
+    {
+        var f = Builders<Conversation>.Filter;
+        var filter = f.Eq(c => c.UserId, userId) & f.Eq(c => c.CompanyId, companyId);
+        if (archived.HasValue) filter &= f.Eq(c => c.Archived, archived.Value);
+        if (!string.IsNullOrWhiteSpace(search))
+            filter &= f.Regex(c => c.Title, new BsonRegularExpression(Regex.Escape(search), "i"));
+        return _db.Conversations.Find(filter).SortByDescending(c => c.UpdatedAt).Limit(limit).ToListAsync(ct);
+    }
+
+    public async Task<Conversation?> GetAsync(string id, string userId, string companyId, CancellationToken ct)
+        => SystemDbContext.IsObjectId(id)
+            ? await _db.Conversations.Find(c => c.Id == id && c.UserId == userId && c.CompanyId == companyId).FirstOrDefaultAsync(ct)
+            : null;
+
+    public Task InsertAsync(Conversation conversation, CancellationToken ct)
+        => _db.Conversations.InsertOneAsync(conversation, cancellationToken: ct);
+
+    public Task UpdateAsync(Conversation conversation, CancellationToken ct)
+        => _db.Conversations.ReplaceOneAsync(c => c.Id == conversation.Id, conversation, cancellationToken: ct);
+
+    public Task DeleteAsync(string id, CancellationToken ct)
+        => _db.Conversations.DeleteOneAsync(c => c.Id == id, ct);
+}
+
+public sealed class MessageRepository : IMessageRepository
+{
+    private readonly SystemDbContext _db;
+    public MessageRepository(SystemDbContext db) => _db = db;
+
+    public Task<List<ChatMessage>> ListAsync(string conversationId, CancellationToken ct)
+        => _db.Messages.Find(m => m.ConversationId == conversationId).SortBy(m => m.CreatedAt).ToListAsync(ct);
+
+    public async Task<List<ChatMessage>> ListRecentAsync(string conversationId, int count, CancellationToken ct)
+    {
+        var list = await _db.Messages.Find(m => m.ConversationId == conversationId)
+            .SortByDescending(m => m.CreatedAt).Limit(count).ToListAsync(ct);
+        list.Reverse();
+        return list;
+    }
+
+    public async Task<ChatMessage?> GetAsync(string id, CancellationToken ct)
+        => SystemDbContext.IsObjectId(id) ? await _db.Messages.Find(m => m.Id == id).FirstOrDefaultAsync(ct) : null;
+
+    public Task InsertAsync(ChatMessage message, CancellationToken ct)
+        => _db.Messages.InsertOneAsync(message, cancellationToken: ct);
+
+    public Task UpdateAsync(ChatMessage message, CancellationToken ct)
+        => _db.Messages.ReplaceOneAsync(m => m.Id == message.Id, message, cancellationToken: ct);
+
+    public Task DeleteAsync(IEnumerable<string> ids, CancellationToken ct)
+    {
+        var valid = ids.Where(SystemDbContext.IsObjectId).ToList();
+        return valid.Count == 0 ? Task.CompletedTask : _db.Messages.DeleteManyAsync(Builders<ChatMessage>.Filter.In(m => m.Id, valid), ct);
+    }
+
+    public Task DeleteByConversationAsync(string conversationId, CancellationToken ct)
+        => _db.Messages.DeleteManyAsync(m => m.ConversationId == conversationId, ct);
+
+    public Task<long> CountAsync(string conversationId, CancellationToken ct)
+        => _db.Messages.CountDocumentsAsync(m => m.ConversationId == conversationId, cancellationToken: ct);
+}
+
+public sealed class QueryLogRepository : IQueryLogRepository
+{
+    private readonly SystemDbContext _db;
+    public QueryLogRepository(SystemDbContext db) => _db = db;
+
+    public Task InsertAsync(QueryLog log, CancellationToken ct) => _db.QueryLogs.InsertOneAsync(log, cancellationToken: ct);
+
+    public Task UpdateAsync(QueryLog log, CancellationToken ct) => _db.QueryLogs.ReplaceOneAsync(l => l.Id == log.Id, log, cancellationToken: ct);
+
+    public async Task<QueryLog?> GetAsync(string id, CancellationToken ct)
+        => SystemDbContext.IsObjectId(id) ? await _db.QueryLogs.Find(l => l.Id == id).FirstOrDefaultAsync(ct) : null;
+
+    public async Task<(List<QueryLog> Items, long Total)> SearchAsync(QueryLogFilter filter, CancellationToken ct)
+    {
+        var f = Builders<QueryLog>.Filter;
+        var q = f.Empty;
+        if (filter.From.HasValue) q &= f.Gte(l => l.CreatedAt, filter.From.Value.ToUniversalTime());
+        if (filter.To.HasValue) q &= f.Lt(l => l.CreatedAt, filter.To.Value.ToUniversalTime());
+        if (!string.IsNullOrEmpty(filter.ProviderId)) q &= f.Eq(l => l.ProviderId, filter.ProviderId);
+        if (!string.IsNullOrEmpty(filter.Model)) q &= f.Eq(l => l.Model, filter.Model);
+        if (filter.Status.HasValue) q &= f.Eq(l => l.Status, filter.Status.Value);
+        if (!string.IsNullOrEmpty(filter.UserId)) q &= f.Eq(l => l.UserId, filter.UserId);
+        if (!string.IsNullOrEmpty(filter.Operation)) q &= f.Eq(l => l.Operation, filter.Operation);
+        if (!string.IsNullOrEmpty(filter.CompanyId)) q &= f.Eq(l => l.CompanyId, filter.CompanyId);
+        if (!string.IsNullOrWhiteSpace(filter.Search))
+            q &= f.Regex(l => l.Question, new BsonRegularExpression(Regex.Escape(filter.Search.Trim()), "i"));
+
+        var total = await _db.QueryLogs.CountDocumentsAsync(q, cancellationToken: ct);
+        var items = await _db.QueryLogs.Find(q)
+            .Project<QueryLog>(Builders<QueryLog>.Projection.Exclude(l => l.DebugTraceJson).Exclude(l => l.GeneratedMql))
+            .SortByDescending(l => l.CreatedAt)
+            .Skip((filter.Page - 1) * filter.PageSize)
+            .Limit(filter.PageSize)
+            .ToListAsync(ct);
+        return (items, total);
+    }
+
+    public Task<List<QueryLog>> RecentAsync(string? companyId, int count, CancellationToken ct)
+    {
+        var filter = string.IsNullOrEmpty(companyId)
+            ? Builders<QueryLog>.Filter.Empty
+            : Builders<QueryLog>.Filter.Eq(l => l.CompanyId, companyId);
+        return _db.QueryLogs.Find(filter)
+            .Project<QueryLog>(Builders<QueryLog>.Projection.Exclude(l => l.DebugTraceJson).Exclude(l => l.GeneratedMql))
+            .SortByDescending(l => l.CreatedAt).Limit(count).ToListAsync(ct);
+    }
+
+    public Task<List<UsageRow>> GetUsageRowsAsync(DateTime from, DateTime to, string? companyId, CancellationToken ct)
+    {
+        var f = Builders<QueryLog>.Filter;
+        var filter = f.Gte(l => l.CreatedAt, from) & f.Lt(l => l.CreatedAt, to);
+        if (!string.IsNullOrEmpty(companyId)) filter &= f.Eq(l => l.CompanyId, companyId);
+        return _db.QueryLogs.Find(filter)
+            .Project(l => new UsageRow
+            {
+                CreatedAt = l.CreatedAt,
+                ProviderId = l.ProviderId,
+                ProviderName = l.ProviderName,
+                ProviderKind = l.ProviderKind,
+                IsLocalProvider = l.IsLocalProvider,
+                Model = l.Model,
+                Status = l.Status,
+                QueryGenerated = l.QueryGenerated,
+                ValidationPassed = l.ValidationPassed,
+                Blocked = l.Blocked,
+                Executed = l.Executed,
+                ExecutionTimeMs = l.ExecutionTimeMs,
+                TotalTimeMs = l.TotalTimeMs,
+                InputTokens = l.InputTokens,
+                OutputTokens = l.OutputTokens,
+                EstimatedCost = l.EstimatedCost
+            })
+            .ToListAsync(ct);
+    }
+
+    public async Task<List<string>> DistinctModelsAsync(CancellationToken ct)
+    {
+        var cursor = await _db.QueryLogs.DistinctAsync(l => l.Model, FilterDefinition<QueryLog>.Empty, cancellationToken: ct);
+        var list = await cursor.ToListAsync(ct);
+        return list.Where(m => m is not null).Select(m => m!).ToList();
+    }
+}
+
+public sealed class SettingsRepository : ISettingsRepository
+{
+    private readonly SystemDbContext _db;
+    public SettingsRepository(SystemDbContext db) => _db = db;
+
+    public async Task<AppSettings?> GetAsync(CancellationToken ct)
+        => await _db.Settings.Find(s => s.Id == "global").FirstOrDefaultAsync(ct);
+
+    public Task SaveAsync(AppSettings settings, CancellationToken ct)
+    {
+        settings.Id = "global";
+        return _db.Settings.ReplaceOneAsync(s => s.Id == "global", settings, new ReplaceOptions { IsUpsert = true }, ct);
+    }
+}
+
+public sealed class AuditLogRepository : IAuditLogRepository
+{
+    private readonly SystemDbContext _db;
+    public AuditLogRepository(SystemDbContext db) => _db = db;
+
+    public Task InsertAsync(AuditLog log, CancellationToken ct) => _db.AuditLogs.InsertOneAsync(log, cancellationToken: ct);
+}
+
+public sealed class DatabaseConfigStore
+{
+    private readonly SystemDbContext _db;
+    public DatabaseConfigStore(SystemDbContext db) => _db = db;
+
+    public async Task<DatabaseConfig?> GetAsync(CancellationToken ct)
+        => await _db.DatabaseConfigs.Find(c => c.Id == "business").FirstOrDefaultAsync(ct);
+
+    public Task SaveAsync(DatabaseConfig config, CancellationToken ct)
+    {
+        config.Id = "business";
+        return _db.DatabaseConfigs.ReplaceOneAsync(c => c.Id == "business", config, new ReplaceOptions { IsUpsert = true }, ct);
+    }
+}
+
+public sealed class SchemaMetadataRepository : ISchemaMetadataRepository
+{
+    private readonly SystemDbContext _db;
+    public SchemaMetadataRepository(SystemDbContext db) => _db = db;
+
+    public Task<List<SchemaMetadata>> ListAsync(CancellationToken ct)
+        => _db.SchemaMetadata.Find(FilterDefinition<SchemaMetadata>.Empty).ToListAsync(ct);
+
+    public async Task<SchemaMetadata?> GetAsync(string collection, CancellationToken ct)
+        => await _db.SchemaMetadata.Find(m => m.Id == collection).FirstOrDefaultAsync(ct);
+
+    public Task SaveAsync(SchemaMetadata metadata, CancellationToken ct)
+        => _db.SchemaMetadata.ReplaceOneAsync(m => m.Id == metadata.Id, metadata, new ReplaceOptions { IsUpsert = true }, ct);
+
+    public Task DeleteAsync(string collection, CancellationToken ct)
+        => _db.SchemaMetadata.DeleteOneAsync(m => m.Id == collection, ct);
+}
