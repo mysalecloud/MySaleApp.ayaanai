@@ -148,6 +148,8 @@ public sealed class QueryExecutionOptions
 {
     public int MaxDocuments { get; init; } = 200;
     public int TimeoutMs { get; init; } = 5000;
+    /// <summary>Optional MongoDB command comment (correlation id). Never contains customer data or secrets.</summary>
+    public string? Comment { get; init; }
 }
 
 public sealed class QueryExecutionResult

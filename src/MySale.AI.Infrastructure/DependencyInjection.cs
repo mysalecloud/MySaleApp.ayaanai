@@ -1,10 +1,13 @@
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using MySale.AI.Application.ActivityTracking;
 using MySale.AI.Application.Abstractions;
 using MySale.AI.Application.Agent;
 using MySale.AI.Application.Mql;
 using MySale.AI.Application.Services;
+using MySale.AI.Infrastructure.ActivityTracking;
 using MySale.AI.Infrastructure.AI;
 using MySale.AI.Infrastructure.BusinessData;
 using MySale.AI.Infrastructure.Media;
@@ -41,7 +44,26 @@ public static class DependencyInjection
         services.AddScoped<ModelCapabilityService>();
         services.AddScoped<VoiceService>();
         services.AddScoped<AIAgentOrchestrator>();
+
+        // Activity tracking (audit trail of every AI request). The agent only gets the write-only tracker;
+        // reading is limited to ActivityQueryService (developer/admin API).
+        services.AddSingleton(BindActivityOptions(configuration));
+        services.TryAddScoped<IRequestContext, NullRequestContext>();
+        services.AddScoped<ActivityTracker>();
+        services.AddScoped<ActivityQueryService>();
         return services;
+    }
+
+    /// <summary>"Activity" section; the AI_ACTIVITY_RETENTION_DAYS environment variable overrides RetentionDays.</summary>
+    public static ActivityOptions BindActivityOptions(IConfiguration configuration)
+    {
+        var options = configuration.GetSection(ActivityOptions.Section).Get<ActivityOptions>() ?? new ActivityOptions();
+        if (int.TryParse(configuration["AI_ACTIVITY_RETENTION_DAYS"], out var days) && days > 0) options.RetentionDays = days;
+        options.RetentionDays = Math.Max(1, options.RetentionDays);
+        options.MaximumDocumentsToStore = Math.Clamp(options.MaximumDocumentsToStore, 0, 500);
+        options.MaximumResultSize = Math.Clamp(options.MaximumResultSize, 1024, 1_000_000);
+        options.MaximumTextLength = Math.Clamp(options.MaximumTextLength, 500, 200_000);
+        return options;
     }
 
     /// <summary>MongoDB, AI providers, security and seeding.</summary>
@@ -108,6 +130,13 @@ public static class DependencyInjection
         services.AddSingleton<IAttachmentProcessor, XlsxProcessor>();
         services.AddSingleton<ISpeechToTextProviderFactory, SpeechToTextProviderFactory>();
         services.AddHostedService<AttachmentCleanupService>();
+
+        // Activity log storage (system DB) + background writer + retention
+        services.AddSingleton<IAIActivityRepository, MongoActivityRepository>();
+        services.AddSingleton<ActivityWriterService>();
+        services.AddSingleton<IAIActivitySink>(sp => sp.GetRequiredService<ActivityWriterService>());
+        services.AddHostedService(sp => sp.GetRequiredService<ActivityWriterService>());
+        services.AddHostedService<ActivityRetentionService>();
 
         // Seeding
         services.AddSingleton<SampleDataSeeder>();

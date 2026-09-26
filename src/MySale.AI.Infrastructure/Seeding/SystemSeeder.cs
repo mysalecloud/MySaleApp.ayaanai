@@ -42,6 +42,14 @@ public sealed class SystemSeeder
                 await SeedUsersAsync(ct);
                 await SeedProvidersAsync(ct);
                 _logger.LogInformation("System database ready");
+                try
+                {
+                    await _db.EnsureActivityIndexesAsync(ct);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogWarning(ex, "Activity log indexes could not be created; activity tracking continues without them");
+                }
             }
             catch (Exception ex) when (ex is MongoException or TimeoutException)
             {

@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.RateLimiting;
 using MySale.AI.Api.Infrastructure;
 using MySale.AI.Api.Security;
 using MySale.AI.Application.Abstractions;
+using MySale.AI.Application.ActivityTracking;
 using MySale.AI.Domain;
 using MySale.AI.Infrastructure;
 using MySale.AI.Infrastructure.Persistence;
@@ -17,6 +18,7 @@ var config = builder.Configuration;
 // ---------------------------------------------------------------- services
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddScoped<IUserContext, HttpUserContext>();
+builder.Services.AddScoped<IRequestContext, HttpRequestContext>(); // correlation id + client app/version/session
 builder.Services.AddAgentInfrastructure(config);
 builder.Services.AddAgentApplication(config);
 
@@ -49,6 +51,13 @@ builder.Services.AddAuthorization(o =>
     o.AddPolicy(Policies.Chat, p => p.RequireAuthenticatedUser());
     o.AddPolicy(Policies.Admin, p => p.RequireAuthenticatedUser().RequireRole(nameof(UserRole.Admin)));
     o.AddPolicy(Policies.Developer, p => p.RequireAuthenticatedUser().RequireRole(nameof(UserRole.Admin), nameof(UserRole.Tester)));
+    // Activity log viewer: developers/admins of the AI dashboard only. Customer (MySaleBooks) tokens are refused
+    // unless Activity:AllowMySaleBooksAdmins is true — normal customers can never read the audit trail.
+    var allowMySaleBooksAdmins = MySale.AI.Infrastructure.DependencyInjection.BindActivityOptions(config).AllowMySaleBooksAdmins;
+    o.AddPolicy(Policies.ActivityViewer, p => p.RequireAuthenticatedUser()
+        .RequireRole(nameof(UserRole.Admin), nameof(UserRole.Tester))
+        .RequireAssertion(ctx => allowMySaleBooksAdmins
+            || ctx.User.FindFirst(TenantClaimTypes.AuthSource)?.Value != TenantClaimTypes.MySaleBooks));
     o.FallbackPolicy = new AuthorizationPolicyBuilder().RequireAuthenticatedUser().Build();
 });
 
@@ -80,6 +89,7 @@ var corsOrigins = config.GetSection("Cors:Origins").Get<string[]>() ?? new[] { "
 builder.Services.AddCors(o => o.AddDefaultPolicy(p => p
     .WithOrigins(corsOrigins)
     .AllowAnyHeader()
+    .WithExposedHeaders(CorrelationIdMiddleware.HeaderName)
     .WithMethods("GET", "POST", "PUT", "PATCH", "DELETE")));
 
 // Request size limit (questions are short; config bodies are small). Upload endpoints raise it per action.
@@ -88,6 +98,7 @@ builder.WebHost.ConfigureKestrel(k => k.Limits.MaxRequestBodySize = 1_000_000);
 var app = builder.Build();
 
 // ---------------------------------------------------------------- pipeline
+app.UseMiddleware<CorrelationIdMiddleware>(); // first: every log line, error and activity carries the same id
 app.UseExceptionHandler();
 app.UseStatusCodePages();
 if (!app.Environment.IsDevelopment())

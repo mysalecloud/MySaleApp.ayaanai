@@ -39,6 +39,9 @@ public sealed class SystemDbContext
     public IMongoCollection<AuditLog> AuditLogs => Database.GetCollection<AuditLog>("audit_logs");
     public IMongoCollection<SchemaMetadata> SchemaMetadata => Database.GetCollection<SchemaMetadata>("schema_metadata");
     public IMongoCollection<Attachment> Attachments => Database.GetCollection<Attachment>("attachments");
+    /// <summary>AYAAN AI activity log (one document per AI request). Written only by the background activity writer.</summary>
+    public IMongoCollection<AIActivity> Activities => Database.GetCollection<AIActivity>("ai_activities");
+    public IMongoCollection<AIConversationActivity> ConversationActivity => Database.GetCollection<AIConversationActivity>("ai_conversation_activity");
 
     public async Task EnsureIndexesAsync(CancellationToken ct)
     {
@@ -58,6 +61,22 @@ public sealed class SystemDbContext
             Builders<Attachment>.IndexKeys.Ascending(a => a.UserId).Ascending(a => a.CompanyId).Descending(a => a.CreatedAt)), cancellationToken: ct);
         await Attachments.Indexes.CreateOneAsync(new CreateIndexModel<Attachment>(
             Builders<Attachment>.IndexKeys.Ascending(a => a.ExpiresAt)), cancellationToken: ct);
+    }
+
+    /// <summary>Indexes of the activity log (separate so a problem here never blocks the rest of the startup).</summary>
+    public async Task EnsureActivityIndexesAsync(CancellationToken ct)
+    {
+        await Activities.Indexes.CreateManyAsync(new[]
+        {
+            new CreateIndexModel<AIActivity>(Builders<AIActivity>.IndexKeys.Ascending(a => a.ActivityId), new CreateIndexOptions { Unique = true }),
+            new CreateIndexModel<AIActivity>(Builders<AIActivity>.IndexKeys.Descending(a => a.Timestamp)),
+            new CreateIndexModel<AIActivity>(Builders<AIActivity>.IndexKeys.Ascending(a => a.CorrelationId)),
+            new CreateIndexModel<AIActivity>(Builders<AIActivity>.IndexKeys.Ascending(a => a.ConversationId).Ascending(a => a.Timestamp)),
+            new CreateIndexModel<AIActivity>(Builders<AIActivity>.IndexKeys.Ascending(a => a.Status).Descending(a => a.Timestamp)),
+            new CreateIndexModel<AIActivity>(Builders<AIActivity>.IndexKeys.Ascending(a => a.TenantRef).Descending(a => a.Timestamp))
+        }, ct);
+        await ConversationActivity.Indexes.CreateOneAsync(new CreateIndexModel<AIConversationActivity>(
+            Builders<AIConversationActivity>.IndexKeys.Descending(c => c.LastActivityAt)), cancellationToken: ct);
     }
 
     public static void RegisterMappings()
@@ -101,6 +120,14 @@ public sealed class SystemDbContext
                 {
                     cm.AutoMap();
                     cm.MapIdMember(s => s.Id);
+                });
+            }
+            if (!BsonClassMap.IsClassMapRegistered(typeof(AIConversationActivity)))
+            {
+                BsonClassMap.RegisterClassMap<AIConversationActivity>(cm =>
+                {
+                    cm.AutoMap();
+                    cm.MapIdMember(c => c.Id); // conversation id (string, not necessarily an ObjectId)
                 });
             }
             if (!BsonClassMap.IsClassMapRegistered(typeof(DatabaseConfig)))

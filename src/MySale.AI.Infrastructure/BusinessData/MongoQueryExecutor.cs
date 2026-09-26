@@ -50,6 +50,7 @@ public sealed class MongoQueryExecutor : IQueryExecutor
                 AllowDiskUse = false,
                 BatchSize = Math.Min(options.MaxDocuments, 1000)
             };
+            if (!string.IsNullOrWhiteSpace(options.Comment)) aggregateOptions.Comment = new BsonString(options.Comment);
 
             var rows = new List<JsonObject>();
             using var cursor = await coll.AggregateAsync(PipelineDefinition<BsonDocument, BsonDocument>.Create(stages), aggregateOptions, deadline.Token);

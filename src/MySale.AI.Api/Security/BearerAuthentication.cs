@@ -25,6 +25,8 @@ public static class Policies
     public const string Admin = "Admin";
     public const string Developer = "Developer"; // Admin or Tester
     public const string Chat = "Chat";
+    /// <summary>AI activity log viewer (Admin/Tester dashboard accounts).</summary>
+    public const string ActivityViewer = "ActivityViewer";
 }
 
 /// <summary>Maps claims of the existing MySaleBooks JWT to the agent's user context (section "MySaleBooksAuth").</summary>

@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.Extensions.Logging;
+using MySale.AI.Application.ActivityTracking;
 using MySale.AI.Application.Abstractions;
 using MySale.AI.Application.Attachments;
 using MySale.AI.Application.Common;
@@ -115,6 +116,7 @@ public sealed class AIAgentOrchestrator
     private readonly ILogger<AIAgentOrchestrator> _logger;
     private readonly AttachmentService? _attachments;
     private readonly ModelCapabilityService? _capabilities;
+    private readonly ActivityTracker? _activity;
 
     public AIAgentOrchestrator(
         IConversationRepository conversations,
@@ -129,8 +131,10 @@ public sealed class AIAgentOrchestrator
         TimeProvider time,
         ILogger<AIAgentOrchestrator> logger,
         AttachmentService? attachments = null,
-        ModelCapabilityService? capabilities = null)
+        ModelCapabilityService? capabilities = null,
+        ActivityTracker? activity = null)
     {
+        _activity = activity;
         _attachments = attachments;
         _capabilities = capabilities;
         _conversations = conversations;
@@ -148,7 +152,24 @@ public sealed class AIAgentOrchestrator
 
     public async Task<ChatResponse> RunAsync(ChatRequest request, IChatEventSink sink, CancellationToken ct)
     {
+        // Activity tracking: every request leaves an audit record. Tracking never changes or breaks the answer.
+        var activity = _activity?.Begin(request, sink.StreamTokens) ?? ActivityRecorder.Disabled;
+        var started = Stopwatch.StartNew();
+        try
+        {
+            return await RunCoreAsync(request, sink, activity, ct);
+        }
+        catch (Exception ex)
+        {
+            activity.Fail(ex, started.ElapsedMilliseconds); // no-op when the turn already completed normally
+            throw;
+        }
+    }
+
+    private async Task<ChatResponse> RunCoreAsync(ChatRequest request, IChatEventSink sink, ActivityRecorder activity, CancellationToken ct)
+    {
         var total = Stopwatch.StartNew();
+        var stage = ActivityStages.Request;
         var settings = await _settings.GetAsync(ct);
         var persist = settings.Chat.SaveConversations;
         var question = (request.Message ?? string.Empty).Trim();
@@ -167,6 +188,7 @@ public sealed class AIAgentOrchestrator
 
         // 1. Conversation + context
         var conversation = await LoadOrCreateConversationAsync(request, question, persist, ct);
+        activity.SetConversation(conversation, persist);
         if (persist && !string.IsNullOrEmpty(request.RegenerateMessageId))
             await RemoveForRegenerateAsync(conversation, request.RegenerateMessageId, ct);
 
@@ -183,6 +205,7 @@ public sealed class AIAgentOrchestrator
 
         var inputType = request.Voice is not null ? "voice" : attachmentsCurrent.Count > 0 ? "attachment" : "text";
         if (request.InputType is "text" or "voice" or "attachment") inputType = request.InputType;
+        activity.SetQuestion(question, inputType);
 
         var now = _time.GetUtcNow().UtcDateTime;
         var userMessage = new ChatMessage
@@ -211,6 +234,7 @@ public sealed class AIAgentOrchestrator
                 (attachmentsEarlier.Count > 0 ? "\nEarlier attachments in context: " + string.Join(", ", attachmentsEarlier.Select(a => a.FileName)) : string.Empty));
         if (persist) await _messages.InsertAsync(userMessage, ct);
         else userMessage.Id = Guid.NewGuid().ToString("N");
+        activity.UserMessage(userMessage.Id);
 
         var assistant = new ChatMessage
         {
@@ -243,12 +267,15 @@ public sealed class AIAgentOrchestrator
             await sink.OnStatusAsync("thinking", "Understanding your question…", token);
 
             // 2. Provider
+            stage = ActivityStages.AIProvider;
             provider = await _providers.ResolveAsync(request.ProviderId, request.Model, settings, token);
             ApplyProvider(assistant, log, provider);
+            activity.SetProvider(provider);
             trace.Add("provider", "AI provider",
                 $"{provider.Config.Name} ({provider.KindInfo?.DisplayName ?? provider.Config.Kind}, {provider.Config.Category})\nModel: {provider.Model}\nEndpoint: {provider.Config.BaseUrl}");
 
             // 3. Schema
+            stage = ActivityStages.Prompt;
             var schema = await _engine.GetAllowedSchemaAsync(settings, token);
             if (schema.Count == 0)
                 throw new QueryExecutionException("No collections are available for querying. Check the Database and Settings pages.");
@@ -288,6 +315,7 @@ public sealed class AIAgentOrchestrator
             var messages = _prompts.BuildQueryMessages(promptContext, schema, history, question,
                 attachmentContext.Any ? attachmentContext.BuildPromptSection() : null);
             trace.Add("queryPrompt", "Generated prompt", PromptBuilder.Render(messages));
+            activity.SetPrompt(messages);
 
             var validationContext = _engine.CreateContext(schema, settings);
             PreparedQuery? prepared = null;
@@ -303,6 +331,7 @@ public sealed class AIAgentOrchestrator
                 await sink.OnStatusAsync(attempt == 0 ? "generating_query" : "repairing",
                     attempt == 0 ? $"Generating query with {provider.Model}…" : "The query needed a fix — asking the model to correct it…", token);
 
+                stage = ActivityStages.QueryGeneration;
                 var sw = Stopwatch.StartNew();
                 var ai = await provider.Provider.GenerateQueryAsync(new AIChatRequest
                 {
@@ -320,6 +349,8 @@ public sealed class AIAgentOrchestrator
                 trace.Add(attempt == 0 ? "generatedMql" : $"repair{attempt}",
                     attempt == 0 ? "Generated MQL (raw model output)" : $"Repair attempt {attempt} (raw model output)",
                     ai.Text, "info", sw.ElapsedMilliseconds);
+                activity.QueryGenerated(attempt, ai.Text, sw.ElapsedMilliseconds, ai.Model);
+                stage = ActivityStages.QueryValidation;
 
                 // Attachment plans (answer from files / calculate over a table / combine with the database)
                 var plan = attachmentContext.Any ? AttachmentPlan.TryParse(ai.Text) : null;
@@ -327,7 +358,11 @@ public sealed class AIAgentOrchestrator
                 {
                     query = null;
                     prepared = null;
+                    var planSw = Stopwatch.StartNew();
                     errors = PrepareAttachmentPlan(plan, attachmentContext, validationContext, settings, out planTarget, out tableResult, out prepared);
+                    activity.Validated(plan.Type == "combined" ? prepared?.Query : null, prepared?.Validation, errors, planSw.ElapsedMilliseconds, parsed: true,
+                        kind: plan.Type);
+                    if (errors.Count == 0) activity.PlanChosen(plan);
                     trace.Add("validation", attempt == 0 ? "Plan validation" : $"Plan validation (repair {attempt})",
                         errors.Count == 0 ? $"✓ {plan.Type} plan" : "✗ Failed\n- " + string.Join("\n- ", errors), errors.Count == 0 ? "ok" : "error");
                     if (errors.Count == 0) { attachmentPlan = plan; break; }
@@ -345,6 +380,7 @@ public sealed class AIAgentOrchestrator
                     errors = new List<string> { parsed.Error ?? "Could not parse the model output." };
                     query = null;
                     prepared = null;
+                    activity.Validated(null, null, errors, 0, parsed: false);
                     trace.Add("validation", "Validation result", "✗ " + errors[0], "error");
                 }
                 else
@@ -353,8 +389,10 @@ public sealed class AIAgentOrchestrator
                     if (query.IsUnsupported) break;
 
                     await sink.OnStatusAsync("validating", "Validating the query…", token);
+                    var validationSw = Stopwatch.StartNew();
                     prepared = _engine.Prepare(query, validationContext, settings);
                     errors = prepared.Validation.Errors.ToList();
+                    activity.Validated(query, prepared.Validation, errors, validationSw.ElapsedMilliseconds, parsed: true);
                     if (prepared.Validation.Blocked) log.Blocked = true;
                     trace.Add("validation", attempt == 0 ? "Validation result" : $"Validation (repair {attempt})",
                         prepared.Validation.IsValid
@@ -408,6 +446,7 @@ public sealed class AIAgentOrchestrator
 
             if (query is { IsUnsupported: true })
             {
+                activity.Unsupported(query);
                 trace.Add("unsupported", "Model declined", query.Reason ?? "No reason given.", "warning");
                 return await FinishAsync(ChatStatus.Unsupported, UserMessages.Unsupported, null);
             }
@@ -423,6 +462,7 @@ public sealed class AIAgentOrchestrator
             if (prepared is null || !prepared.IsExecutable)
             {
                 assistant.ValidationErrors = log.ValidationErrors = errors;
+                activity.Rejected(query, errors, log.Blocked);
                 if (log.Blocked)
                     await _audit.LogAsync("QueryBlocked", $"Question: {question}\nReasons: {string.Join("; ", errors)}", CancellationToken.None);
                 await sink.OnQueryAsync(MessageMapper.ToQueryInfo(assistant), token);
@@ -435,50 +475,81 @@ public sealed class AIAgentOrchestrator
             assistant.Mql = log.FinalMql = prepared.Mql;
             assistant.ValidationErrors = prepared.Validation.Warnings;
             trace.Add("mongoQuery", "MongoDB query (validated + tenant-scoped)", prepared.Mql ?? string.Empty, "ok");
+            activity.Approved(prepared);
             await sink.OnQueryAsync(MessageMapper.ToQueryInfo(assistant), token);
 
             // 7. Execute
             await sink.OnStatusAsync("executing", "Running the query…", token);
             log.Executed = true;
-            var executed = await _engine.ExecuteAsync(prepared, settings, token);
+            stage = ActivityStages.MongoExecution;
+            activity.ExecutionStarted(prepared.Validation.Collection, query?.Operation);
+            ExecutedQuery executed;
+            try
+            {
+                executed = await _engine.ExecuteAsync(prepared, settings, token,
+                    _activity is null ? null : ActivityRecorder.MongoComment(_activity.CorrelationId));
+            }
+            catch (QueryTimeoutException ex) { activity.ExecutionFailed(ex, timeout: true); throw; }
+            catch (QueryExecutionException ex) { activity.ExecutionFailed(ex, timeout: false); throw; }
+            catch (OperationCanceledException ex) when (!ct.IsCancellationRequested) { activity.ExecutionFailed(ex, timeout: true); throw; }
+            activity.ExecutionSucceeded(executed);
             assistant.QueryExecuted = log.ExecutionSucceeded = true;
+
+            // 7b. Show names instead of database ids ("supplierId" → supplier name), read-only + tenant-scoped.
+            var references = await _engine.ResolveReferencesAsync(prepared, executed, schema, settings, token,
+                _activity is null ? null : ActivityRecorder.MongoComment(_activity.CorrelationId));
+            if (references.Changed)
+            {
+                executed = references.Result;
+                trace.Add("references", "IDs → names", string.Join("\n", references.Notes), "ok", references.ElapsedMs);
+                activity.ReferencesResolved(references.Notes, references.ElapsedMs);
+            }
             return await AnswerFromRowsAsync(executed.Rows, executed.Columns, executed.Truncated, query?.Explanation, query?.Visualization, executed.ElapsedMs);
         }
         catch (AttachmentException ex)
         {
+            activity.Error(stage, ActivityErrorTypes.AttachmentError, ex);
             trace.Add("error", "Attachment error", ex.Message, "error");
             return await FinishAsync(ChatStatus.Error, ex.Message, ex.Message);
         }
         catch (AIProviderException ex)
         {
             _logger.LogWarning(ex, "AI provider failure for {Provider}", provider?.Config.Name);
+            activity.Error(stage == ActivityStages.QueryValidation ? ActivityStages.QueryGeneration : stage, ActivityErrorTypes.AIProviderError, ex);
             trace.Add("error", "AI provider error", ex.Message, "error");
             return await FinishAsync(ChatStatus.ProviderError, UserMessages.ProviderUnavailable, ex.Message);
         }
         catch (QueryTimeoutException ex)
         {
+            if (stage != ActivityStages.MongoExecution) activity.Error(stage, ActivityErrorTypes.TimeoutError, ex);
             trace.Add("error", "MongoDB timeout", ex.Message, "error");
             return await FinishAsync(ChatStatus.Timeout, UserMessages.QueryTimeout, ex.Message);
         }
         catch (QueryExecutionException ex)
         {
             _logger.LogWarning(ex, "Query execution failed");
+            // Execution errors are recorded by ExecutionFailed; earlier ones (e.g. no collections available) are prompt/schema errors.
+            if (stage != ActivityStages.MongoExecution) activity.Error(stage, ActivityErrorTypes.PromptError, ex);
             trace.Add("error", "MongoDB error", ex.Message, "error");
             return await FinishAsync(ChatStatus.DatabaseError, UserMessages.DatabaseError, ex.Message);
         }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
         {
+            if (stage != ActivityStages.MongoExecution) activity.Error(stage, ActivityErrorTypes.TimeoutError, ex, $"Request timeout after {settings.Ai.TimeoutSeconds} s");
             trace.Add("error", "Timeout", $"The request exceeded {settings.Ai.TimeoutSeconds} seconds.", "error");
             return await FinishAsync(ChatStatus.Timeout, UserMessages.RequestTimeout, "Request timeout");
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException ex)
         {
+            activity.Error(stage, ActivityErrorTypes.CancelledError, ex, "Cancelled by client");
             trace.Add("error", "Cancelled", "The client cancelled the request.", "warning");
             return await FinishAsync(ChatStatus.Error, UserMessages.Cancelled, "Cancelled by client");
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Unexpected error in AI agent pipeline");
+            activity.Error(ex is TenantResolutionException ? ActivityStages.Authentication : stage,
+                ex is TenantResolutionException ? ActivityErrorTypes.AuthenticationError : ActivityErrorTypes.UnknownError, ex);
             trace.Add("error", "Unexpected error", ex.GetType().Name + ": " + ex.Message, "error");
             return await FinishAsync(ChatStatus.Error, UserMessages.Unexpected, ex.GetType().Name);
         }
@@ -489,6 +560,7 @@ public sealed class AIAgentOrchestrator
         {
             assistant.ExecutionTimeMs = log.ExecutionTimeMs = elapsedMs;
             assistant.ResultCount = log.ResultCount = rows.Count;
+            activity.SetResult(rows, columns, truncated);
             assistant.Truncated = truncated;
             assistant.Columns = columns;
 
@@ -558,6 +630,8 @@ public sealed class AIAgentOrchestrator
         async Task<ChatResponse> GenerateAndFinishAsync(List<AIChatMessage> answerMessages, List<JsonObject>? groundingRows)
         {
             string answer;
+            stage = ActivityStages.ResponseGeneration;
+            activity.ResponseStarted();
             var answerSw = Stopwatch.StartNew();
             try
             {
@@ -567,6 +641,7 @@ public sealed class AIAgentOrchestrator
             {
                 answerSw.Stop();
                 assistant.AiAnswerTimeMs = answerSw.ElapsedMilliseconds;
+                activity.ResponseFailed(ex, answerSw.ElapsedMilliseconds);
                 trace.Add("finalResponse", "Final AI response", "Provider failed while writing the answer: " + ex.Message, "error", answerSw.ElapsedMilliseconds);
                 return await FinishAsync(ChatStatus.ProviderError, UserMessages.AnswerFailed, ex.Message);
             }
@@ -644,6 +719,9 @@ public sealed class AIAgentOrchestrator
                 _logger.LogError(ex, "Failed to persist chat turn");
                 if (string.IsNullOrEmpty(assistant.Id)) assistant.Id = Guid.NewGuid().ToString("N");
             }
+
+            // Activity log: queued for the background writer (never blocks or fails the answer).
+            activity.Complete(status, assistant.Content, error, assistant, log, conversation.MessageCount, persist, total.ElapsedMilliseconds);
 
             return MessageMapper.ToChatResponse(conversation, userMessage, assistant, settings.Chat.DeveloperMode ? trace : null);
         }

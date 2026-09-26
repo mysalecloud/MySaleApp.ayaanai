@@ -2,6 +2,7 @@ using System.Runtime.CompilerServices;
 using System.Text.Json.Nodes;
 using Microsoft.Extensions.Logging.Abstractions;
 using MySale.AI.Application.Abstractions;
+using MySale.AI.Application.ActivityTracking;
 using MySale.AI.Application.Agent;
 using MySale.AI.Application.Mql;
 using MySale.AI.Application.Services;
@@ -227,8 +228,9 @@ public sealed class Harness
     public FakeExecutor Executor { get; } = new();
     public FakeUser User { get; } = new();
     public AIAgentOrchestrator Orchestrator { get; }
+    public FakeRequestContext Request { get; } = new();
 
-    public Harness()
+    public Harness(IAIActivitySink? activitySink = null, ActivityOptions? activityOptions = null)
     {
         Store.Providers.Add(new ProviderConfig
         {
@@ -244,6 +246,33 @@ public sealed class Harness
 
         Orchestrator = new AIAgentOrchestrator(
             new MemConversations(Store), new MemMessages(Store), new MemLogs(Store), providers, settings, engine,
-            new PromptBuilder(), audit, User, TimeProvider.System, NullLogger<AIAgentOrchestrator>.Instance);
+            new PromptBuilder(), audit, User, TimeProvider.System, NullLogger<AIAgentOrchestrator>.Instance,
+            activity: activitySink is null ? null
+                : new ActivityTracker(activitySink, activityOptions ?? new ActivityOptions(), Request, User, TimeProvider.System));
+    }
+}
+
+public sealed class FakeRequestContext : IRequestContext
+{
+    public string CorrelationId { get; set; } = "corr-test-0001";
+    public string? ClientApp { get; set; } = "mysalebooks-web";
+    public string? ClientVersion { get; set; } = "1.0.212";
+    public string? SessionId { get; set; } = "session-abc";
+    public string? Endpoint { get; set; } = "/api/ai/chat";
+}
+
+/// <summary>In-memory activity sink (captures what would be written to the activity log).</summary>
+public sealed class MemActivitySink : IAIActivitySink
+{
+    public List<AIActivity> Activities { get; } = new();
+    public List<ConversationActivityUpdate> Conversations { get; } = new();
+    public bool Throw { get; set; }
+
+    public bool TryEnqueue(AIActivity activity, ConversationActivityUpdate? conversation)
+    {
+        if (Throw) throw new InvalidOperationException("activity database unavailable");
+        Activities.Add(activity);
+        if (conversation is not null) Conversations.Add(conversation);
+        return true;
     }
 }

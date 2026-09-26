@@ -250,4 +250,48 @@ public class OrchestratorTests
         public Task OnQueryAsync(QueryInfoDto query, CancellationToken ct) { Query = query; return Task.CompletedTask; }
         public Task OnTokenAsync(string text, CancellationToken ct) { Tokens.Add(text); return Task.CompletedTask; }
     }
+
+    [Fact]
+    public async Task Ids_in_the_result_are_replaced_by_names()
+    {
+        const string id1 = "68b375874f0fda25b75356fa", id2 = "68b4b2a24f0fda25b7535d93";
+        var h = new Harness();
+        h.Provider.QueryResponses.Enqueue(_ => """
+            {"operation":"aggregate","collection":"Sales","pipeline":[
+              {"$group":{"_id":"$CustomerId","totalSales":{"$sum":"$NetAmount"}}},{"$sort":{"totalSales":-1}},{"$limit":5}],
+             "visualization":"bar"}
+            """);
+        var lookups = new List<string>();
+        h.Executor.Handler = (collection, pipeline) =>
+        {
+            if (collection == "Customers")
+            {
+                lookups.Add(pipeline.ToJsonString());
+                return new List<JsonObject>
+                {
+                    new() { ["_id"] = id1, ["CustomerName"] = "Al Noor Trading" },
+                    new() { ["_id"] = id2, ["CustomerName"] = "Gulf Star Supplies" }
+                };
+            }
+            return new List<JsonObject> { new() { ["_id"] = id1, ["totalSales"] = 64488.86 }, new() { ["_id"] = id2, ["totalSales"] = 43979.59 } };
+        };
+        h.Provider.Answer = req =>
+        {
+            var data = req.Messages[^1].Content;
+            Assert.Contains("Al Noor Trading", data);
+            Assert.DoesNotContain(id1, data); // the model never sees the raw ids
+            return "Al Noor Trading leads with AED 64,488.86.";
+        };
+
+        var r = await h.Orchestrator.RunAsync(Ask("Top customers by sales"), NullChatEventSink.Instance, default);
+
+        Assert.Equal(ChatStatus.Success, r.Status);
+        Assert.Equal("Al Noor Trading", r.Data![0]!["customerName"]!.GetValue<string>());
+        Assert.Equal("Gulf Star Supplies", r.Data[1]!["customerName"]!.GetValue<string>());
+        Assert.DoesNotContain(id1, r.Data.ToJsonString());
+        Assert.Contains("customerName", r.Columns);
+        // The name lookup is tenant-scoped like every other query
+        var lookup = Assert.Single(lookups);
+        Assert.Contains(TestData.CompanyA, lookup);
+    }
 }
