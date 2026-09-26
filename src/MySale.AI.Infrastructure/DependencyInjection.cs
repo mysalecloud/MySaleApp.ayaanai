@@ -91,6 +91,8 @@ public static class DependencyInjection
         services.AddSingleton<IAIProviderBuilder, OpenAIProviderBuilder>();
         services.AddSingleton<IAIProviderBuilder, OpenAICompatibleProviderBuilder>();
         services.AddSingleton<IAIProviderFactory, AIProviderFactory>();
+        services.Configure<AiProvidersOptions>(configuration.GetSection(AiProvidersOptions.Section));
+        services.AddSingleton<IProviderOverrides, ConfigurationProviderOverrides>();
 
         // Voice & attachments — files live outside the web root, keyed by id; never executed or served inline.
         services.Configure<AttachmentStorageOptions>(configuration.GetSection(AttachmentStorageOptions.Section));
