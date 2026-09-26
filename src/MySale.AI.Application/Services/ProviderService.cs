@@ -29,12 +29,16 @@ public sealed class ProviderService
     private readonly ISecretProtector _secrets;
     private readonly AuditService _audit;
 
-    public ProviderService(IProviderRepository repository, IAIProviderFactory factory, ISecretProtector secrets, AuditService audit)
+    private readonly IProviderOverrides? _overrides;
+
+    public ProviderService(IProviderRepository repository, IAIProviderFactory factory, ISecretProtector secrets, AuditService audit,
+        IProviderOverrides? overrides = null)
     {
         _repository = repository;
         _factory = factory;
         _secrets = secrets;
         _audit = audit;
+        _overrides = overrides;
     }
 
     public IReadOnlyList<ProviderKindInfo> Kinds => _factory.Kinds;
@@ -168,13 +172,23 @@ public sealed class ProviderService
     /// <summary>Selects the provider + model for a chat turn: explicit request → settings default → provider default → first enabled.</summary>
     public async Task<ResolvedProvider> ResolveAsync(string? providerId, string? model, AppSettings settings, CancellationToken ct)
     {
-        var all = await _repository.ListAsync(ct);
+        var all = await LoadWithOverridesAsync(ct);
         ProviderConfig? config;
+        var deploymentDefault = string.IsNullOrWhiteSpace(_overrides?.DefaultProviderName)
+            ? null
+            : all.FirstOrDefault(p => string.Equals(p.Name, _overrides!.DefaultProviderName!.Replace('_', ' ').Trim(), StringComparison.OrdinalIgnoreCase));
         if (!string.IsNullOrWhiteSpace(providerId))
         {
             config = all.FirstOrDefault(p => p.Id == providerId)
                      ?? throw new AIProviderException("The selected AI provider no longer exists.");
             if (!config.Enabled) throw new AIProviderException($"AI provider '{config.Name}' is disabled.");
+        }
+        else if (deploymentDefault is not null)
+        {
+            // Deployment configuration wins over the dashboard default (e.g. Cloud Run uses OpenAI, local uses Ollama).
+            config = deploymentDefault;
+            if (string.IsNullOrWhiteSpace(model) && !string.IsNullOrWhiteSpace(_overrides!.DefaultModel))
+                model = _overrides.DefaultModel;
         }
         else
         {
@@ -207,7 +221,7 @@ public sealed class ProviderService
     /// </summary>
     public async Task<ProviderConfig?> ResolveSpeechProviderAsync(string? providerId, CancellationToken ct)
     {
-        var all = await _repository.ListAsync(ct);
+        var all = await LoadWithOverridesAsync(ct);
         bool Usable(ProviderConfig p) => p.Kind is "openai" or "openai-compatible"
                                          && (!RequiresKey(p) || !string.IsNullOrEmpty(p.ApiKeyEncrypted));
         if (!string.IsNullOrWhiteSpace(providerId))
@@ -216,6 +230,26 @@ public sealed class ProviderService
     }
 
     // ------------------------------------------------------------------ helpers
+
+    /// <summary>
+    /// Provider list for runtime use, with deployment overrides applied in memory only (never persisted).
+    /// An API key from the environment is protected with this server's key ring so the factory can use it.
+    /// </summary>
+    private async Task<List<ProviderConfig>> LoadWithOverridesAsync(CancellationToken ct)
+    {
+        var all = await _repository.ListAsync(ct);
+        if (_overrides is null) return all;
+        foreach (var p in all)
+        {
+            var key = _overrides.ApiKeyFor(p.Name);
+            if (!string.IsNullOrWhiteSpace(key)) p.ApiKeyEncrypted = _secrets.Protect(key.Trim());
+            var url = _overrides.BaseUrlFor(p.Name);
+            if (!string.IsNullOrWhiteSpace(url)) p.BaseUrl = url.Trim().TrimEnd('/');
+            var m = _overrides.ModelFor(p.Name);
+            if (!string.IsNullOrWhiteSpace(m)) p.DefaultModel = m.Trim();
+        }
+        return all;
+    }
 
     private async Task<ProviderConfig> Load(string id, CancellationToken ct)
         => await _repository.GetAsync(id, ct) ?? throw new NotFoundException("AI provider not found.");

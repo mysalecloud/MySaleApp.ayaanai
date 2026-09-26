@@ -83,20 +83,28 @@ public sealed class HmacTokenService : ITokenService
 {
     private static readonly byte[] Header = Encoding.UTF8.GetBytes("{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
     private readonly AuthOptions _options;
-    private readonly byte[] _key;
+    private readonly byte[]? _key;
     private readonly TimeProvider _time;
 
     public HmacTokenService(IOptions<AuthOptions> options, TimeProvider time)
     {
         _options = options.Value;
         _time = time;
-        if (string.IsNullOrWhiteSpace(_options.SigningKey) || _options.SigningKey.Length < 32)
-            throw new InvalidOperationException("Auth:SigningKey must be configured with at least 32 characters.");
-        _key = Encoding.UTF8.GetBytes(_options.SigningKey);
+        // Prototype (local-user) tokens are optional. When no signing key is configured
+        // (e.g. a MySaleBooks-JWT-only deployment) they are simply disabled instead of
+        // failing every request.
+        _key = !string.IsNullOrWhiteSpace(_options.SigningKey) && _options.SigningKey.Length >= 32
+            ? Encoding.UTF8.GetBytes(_options.SigningKey)
+            : null;
     }
+
+    /// <summary>True when prototype tokens can be issued/validated.</summary>
+    public bool IsEnabled => _key is not null;
 
     public IssuedToken Issue(AppUser user)
     {
+        if (_key is null)
+            throw new InvalidOperationException("Auth:SigningKey must be configured with at least 32 characters.");
         var now = _time.GetUtcNow();
         var expires = now.AddMinutes(_options.TokenLifetimeMinutes);
         var payload = new TokenPayload
@@ -122,6 +130,7 @@ public sealed class HmacTokenService : ITokenService
     public bool TryValidate(string token, out TokenPayload? payload)
     {
         payload = null;
+        if (_key is null) return false;
         var parts = token.Split('.');
         if (parts.Length != 3) return false;
 
@@ -145,7 +154,7 @@ public sealed class HmacTokenService : ITokenService
 
     private byte[] Sign(string data)
     {
-        using var hmac = new HMACSHA256(_key);
+        using var hmac = new HMACSHA256(_key!);
         return hmac.ComputeHash(Encoding.UTF8.GetBytes(data));
     }
 

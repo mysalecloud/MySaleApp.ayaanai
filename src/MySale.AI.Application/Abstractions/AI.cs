@@ -106,6 +106,22 @@ public interface IAIProviderBuilder
     IAIProvider Build(ProviderConfig config, string? apiKey);
 }
 
+/// <summary>
+/// Deployment-level provider settings (environment variables / secrets). They take precedence over the
+/// values stored in the system database, so a cloud deployment can use its own provider and API key
+/// without re-entering encrypted secrets through the dashboard.
+/// </summary>
+public interface IProviderOverrides
+{
+    /// <summary>Name of the provider to use by default (e.g. "OpenAI"), or null.</summary>
+    string? DefaultProviderName { get; }
+    /// <summary>Model to use with the default provider, or null.</summary>
+    string? DefaultModel { get; }
+    string? ApiKeyFor(string providerName);
+    string? BaseUrlFor(string providerName);
+    string? ModelFor(string providerName);
+}
+
 public interface IAIProviderFactory
 {
     IReadOnlyList<ProviderKindInfo> Kinds { get; }
