@@ -26,10 +26,12 @@ public sealed class ActivityTracker
     private readonly IUserContext _user;
     private readonly TimeProvider _time;
     private readonly ILogger _logger;
+    private readonly ISecretProtector? _protector;
 
     public ActivityTracker(IAIActivitySink sink, ActivityOptions options, IRequestContext request, IUserContext user,
-        TimeProvider time, ILogger<ActivityTracker>? logger = null)
+        TimeProvider time, ILogger<ActivityTracker>? logger = null, ISecretProtector? protector = null)
     {
+        _protector = protector;
         _sink = sink;
         _options = options;
         _request = request;
@@ -39,13 +41,14 @@ public sealed class ActivityTracker
     }
 
     public string CorrelationId => _request.CorrelationId;
+    public ActivityOptions Options => _options;
 
     public ActivityRecorder Begin(ChatRequest request, bool streamed)
     {
         if (!_options.Enabled) return ActivityRecorder.Disabled;
         try
         {
-            return new ActivityRecorder(_sink, _options, _request, _user, _time, _logger, request, streamed);
+            return new ActivityRecorder(_sink, _options, _request, _user, _time, _logger, request, streamed, _protector);
         }
         catch (Exception ex)
         {
@@ -71,6 +74,10 @@ public sealed class ActivityRecorder
     private readonly ILogger _logger = NullLogger.Instance;
     private readonly AIActivity _a = new();
     private readonly List<string> _sensitive = new();
+    private readonly ISecretProtector? _protector;
+
+    /// <summary>Upper bound for exact (not redacted, not shortened) query text: far above any valid query (MongoDB documents max 16 MB).</summary>
+    private const int ExactLimit = 2_000_000;
 
     private string? _conversationTitle;
     private long _mongoMs;
@@ -80,9 +87,10 @@ public sealed class ActivityRecorder
     private ActivityRecorder() { }
 
     internal ActivityRecorder(IAIActivitySink sink, ActivityOptions options, IRequestContext request, IUserContext user,
-        TimeProvider time, ILogger logger, ChatRequest chat, bool streamed)
+        TimeProvider time, ILogger logger, ChatRequest chat, bool streamed, ISecretProtector? protector = null)
     {
         _enabled = true;
+        _protector = protector;
         _sink = sink;
         _options = options;
         _time = time;
@@ -95,6 +103,7 @@ public sealed class ActivityRecorder
         _a.Timestamp = now;
         _a.CreatedAt = now;
         _a.UserId = string.IsNullOrEmpty(user.UserId) ? null : user.UserId;
+        _a.UserName = string.IsNullOrEmpty(user.DisplayName) ? null : ActivityRedactor.Truncate(user.DisplayName, 120);
         _a.TenantRef = ActivityHashing.TenantRef(user.DatabaseName, user.CompanyId);
         _a.AuthSource = user.IsMySaleBooksUser ? "mysalebooks" : "agent";
         _a.ConversationId = string.IsNullOrWhiteSpace(chat.ConversationId) ? null : chat.ConversationId;
@@ -160,6 +169,15 @@ public sealed class ActivityRecorder
         AddStage(ActivityStages.Prompt, "ok", null, $"{PromptBuilder.Version} · {messages.Count} messages");
     });
 
+    /// <summary>Schema context offered to the model (allowed collections and their fields).</summary>
+    public void SetSchema(IReadOnlyList<CollectionSchema> schema) => Safe(() =>
+    {
+        _a.Ai.SchemaCollections = schema.Select(c => c.Name).ToList();
+        var fingerprint = string.Join("|", schema.OrderBy(c => c.Name, StringComparer.Ordinal)
+            .Select(c => c.Name + ":" + string.Join(",", c.Fields.Select(f => f.Name + "/" + f.Type))));
+        _a.Ai.SchemaContextRef = "sha256:" + ActivityHashing.Sha256(fingerprint)[..16];
+    });
+
     // ------------------------------------------------------------------ query generation + validation
 
     /// <summary>One model call of the query step (first attempt or a repair).</summary>
@@ -178,8 +196,9 @@ public sealed class ActivityRecorder
             Attempt = attempt,
             At = now,
             DurationMs = durationMs,
-            RawOutput = _options.StoreRawModelOutput ? Text(rawOutput) : null
+            RawOutput = _options.StoreRawModelOutput ? Exact(rawOutput) : null
         });
+        _a.Ai.QueryGenerationStatus = "Generated";
         AddStage(ActivityStages.QueryGeneration, "ok", durationMs, attempt == 0 ? "Query generated" : $"Repair attempt {attempt}");
     });
 
@@ -203,6 +222,7 @@ public sealed class ActivityRecorder
             v.BlockedOperations = v.Blocked ? ExtractOperators(errors) : new List<string>();
             v.DurationMs = _validationMs;
             if (query is not null) SetQuery(query, kind);
+            if (!parsed) _a.Ai.QueryGenerationStatus = "Unparseable";
             AddStage(ActivityStages.QueryValidation, errors.Count == 0 ? "ok" : "error", durationMs,
                 errors.Count == 0
                     ? "Approved" + (v.Warnings.Count > 0 ? $" · {v.Warnings.Count} warning(s)" : string.Empty)
@@ -213,6 +233,8 @@ public sealed class ActivityRecorder
     {
         SetQuery(query, "unsupported");
         _a.Ai.Intent = "unsupported";
+        _a.Ai.ToolSelected = "declined";
+        _a.Ai.QueryGenerationStatus = "Declined";
         _a.Ai.DeclineReason = Text(query.Reason ?? string.Empty, 1000);
         AddStage(ActivityStages.QueryGeneration, "warning", null, "Model declined: " + Text(query.Reason ?? "no reason", 300));
     });
@@ -226,20 +248,27 @@ public sealed class ActivityRecorder
         if (plan.Table is not null) json["table"] = plan.Table.DeepClone();
         if (plan.Column is not null) json["column"] = plan.Column;
         if (plan.QueryJson is not null) json["query"] = plan.QueryJson.DeepClone();
-        q.GeneratedQueryJson = ActivityRedactor.RedactJsonString(json, _sensitive, _options.MaximumTextLength);
+        q.GeneratedQueryJson = json.ToCompact(); // exact plan, not shortened
         q.QueryHash = ActivityHashing.Sha256(json.ToCompact());
         _a.Ai.Intent = "attachment:" + plan.Type;
+        _a.Ai.ToolSelected = plan.Type switch { "table" => "attachment-table", "combined" => "attachment+database", _ => "attachment-answer" };
         _a.Ai.Explanation = Text(plan.Explanation ?? string.Empty, 2000);
         _a.Ai.VisualizationHint = plan.Visualization;
     });
 
-    /// <summary>The query passed validation and was tenant-scoped (what MongoDB will run).</summary>
-    public void Approved(PreparedQuery prepared) => Safe(() =>
+    /// <summary>
+    /// The query passed validation and was tenant-scoped: stores the complete executed pipeline (every stage, exact)
+    /// and the server-side query parameters.
+    /// </summary>
+    public void Approved(PreparedQuery prepared, object? parameters = null) => Safe(() =>
     {
         SetQuery(prepared.Query, _a.Query?.Kind == "combined" ? "combined" : "query");
         var q = _a.Query!;
         q.Collection = prepared.Validation.Collection ?? q.Collection;
-        q.ExecutedMql = Text(prepared.Mql ?? string.Empty);
+        q.ExecutedMql = prepared.Mql;                                  // complete, not shortened
+        q.ExecutedPipelineJson = prepared.ScopedPipeline?.ToCompact(); // complete Extended JSON
+        q.Stages = StageNames(prepared.ScopedPipeline ?? prepared.Validation.Pipeline);
+        if (parameters is not null) q.QueryParametersJson = JsonSerializer.Serialize(parameters, JsonHelpers.Compact);
         if (_a.Validation is { } v) v.RejectedQueryJson = null;
     });
 
@@ -253,7 +282,7 @@ public sealed class ActivityRecorder
         if (blocked && v.BlockedOperations.Count == 0) v.BlockedOperations = ExtractOperators(errors);
         v.RejectedQueryJson = query is null
             ? (_a.Query?.Attempts.LastOrDefault()?.RawOutput)
-            : ActivityRedactor.RedactJsonString(query.ToJson(), _sensitive, _options.MaximumTextLength);
+            : query.ToJson().ToCompact(); // exact rejected query for security review
         _a.Ai.Intent ??= blocked ? "blocked" : "invalid-query";
         AddError(ActivityStages.QueryValidation, ActivityErrorTypes.QueryValidationError,
             (blocked ? "Blocked: " : "Rejected: ") + string.Join("; ", errors), null);
@@ -261,10 +290,12 @@ public sealed class ActivityRecorder
 
     // ------------------------------------------------------------------ MongoDB
 
-    public void ExecutionStarted(string? collection, string? operation) => Safe(() =>
+    public void ExecutionStarted(string? collection, string? operation, int timeoutLimitMs = 0, int maxDocuments = 0) => Safe(() =>
     {
         _a.Execution = new ActivityExecutionInfo
         {
+            TimeoutLimitMs = timeoutLimitMs,
+            MaxDocuments = maxDocuments,
             Status = "Running",
             TenantRef = _a.TenantRef,
             Collection = collection,
@@ -297,6 +328,70 @@ public sealed class ActivityRecorder
         _mongoMs = e.DurationMs;
         AddStage(ActivityStages.MongoExecution, "error", e.DurationMs, Text(ex.Message, 300));
         AddError(ActivityStages.MongoExecution, timeout ? ActivityErrorTypes.TimeoutError : ActivityErrorTypes.MongoDBError, ex.Message, ex);
+    });
+
+    /// <summary>
+    /// The first query returned no rows; it was re-run with case-/space-insensitive text matching. Both executed MQLs are
+    /// kept exactly: the first in InitialExecutedMql, the retry becomes ExecutedMql when it returned rows.
+    /// </summary>
+    public void TextMatchRetried(PreparedQuery retry, IReadOnlyList<string> fields, ExecutedQuery result, bool used) => Safe(() =>
+    {
+        var q = _a.Query ??= new ActivityQueryInfo();
+        q.RelaxedFields = fields.ToList();
+        if (used)
+        {
+            q.InitialExecutedMql = q.ExecutedMql;
+            q.ExecutedMql = retry.Mql;
+            q.ExecutedPipelineJson = retry.ScopedPipeline?.ToCompact();
+            q.Stages = StageNames(retry.ScopedPipeline ?? retry.Validation.Pipeline);
+            var e = _a.Execution ??= new ActivityExecutionInfo { TenantRef = _a.TenantRef, StartedAt = Now };
+            e.Retries += 1;
+            e.DocumentsReturned = result.Rows.Count;
+            e.Truncated = result.Truncated;
+            e.DurationMs += result.ElapsedMs;
+            e.CompletedAt = Now;
+        }
+        _mongoMs += result.ElapsedMs;
+        AddStage("TextMatchRetry", used ? "ok" : "warning", result.ElapsedMs,
+            $"{string.Join(", ", fields)}: {result.Rows.Count} document(s){(used ? string.Empty : " — kept the original empty result")}");
+    });
+
+    /// <summary>Business terms of the question mapped to accounting concepts / collections / stored group values.</summary>
+    public void TermsResolved(string summary, long? durationMs) => Safe(() =>
+    {
+        if (durationMs is { } ms) _mongoMs += ms;
+        AddStage("BusinessTerms", "ok", durationMs, Text(summary, 1000));
+    });
+
+    /// <summary>The model (or the semantic step) asked the user a short question instead of running a query.</summary>
+    public void Clarification(string question) => Safe(() =>
+    {
+        _a.Ai.Intent = "clarification";
+        _a.Ai.ToolSelected = "clarification";
+        _a.Ai.QueryGenerationStatus = "Clarification";
+        AddStage(ActivityStages.QueryGeneration, "warning", null, "Clarification: " + Text(question, 300));
+    });
+
+    /// <summary>Empty result re-checked against the business mapping; a corrected query was generated and run.</summary>
+    public void SemanticRetried(PreparedQuery retry, ExecutedQuery result, bool used) => Safe(() =>
+    {
+        var q = _a.Query ??= new ActivityQueryInfo();
+        if (used)
+        {
+            q.InitialExecutedMql ??= q.ExecutedMql;
+            q.ExecutedMql = retry.Mql;
+            q.ExecutedPipelineJson = retry.ScopedPipeline?.ToCompact();
+            q.Stages = StageNames(retry.ScopedPipeline ?? retry.Validation.Pipeline);
+            var e = _a.Execution ??= new ActivityExecutionInfo { TenantRef = _a.TenantRef, StartedAt = Now };
+            e.Retries += 1;
+            e.DocumentsReturned = result.Rows.Count;
+            e.Truncated = result.Truncated;
+            e.DurationMs += result.ElapsedMs;
+            e.CompletedAt = Now;
+        }
+        _mongoMs += result.ElapsedMs;
+        AddStage("SemanticRetry", used ? "ok" : "warning", result.ElapsedMs,
+            $"{retry.Validation.Collection}: {result.Rows.Count} document(s){(used ? string.Empty : " — kept the original empty result")}");
     });
 
     /// <summary>Database ids in the result were replaced by names (extra read-only lookups).</summary>
@@ -347,6 +442,40 @@ public sealed class ActivityRecorder
     {
         _a.Response ??= new ActivityResponseInfo();
         _a.Response.StartedAt = Now;
+        _a.Ai.ResponseGenerationStatus = "Running";
+    });
+
+    /// <summary>Raw answer text returned by the model (stored exactly, before the final trim / fallback).</summary>
+    public void AnswerGenerated(string rawAnswer) => Safe(() =>
+    {
+        _a.Response ??= new ActivityResponseInfo();
+        _a.Response.AiGeneratedText = rawAnswer;
+        _a.Ai.ResponseGenerationStatus = string.IsNullOrWhiteSpace(rawAnswer) ? "Failed" : "Generated";
+    });
+
+    /// <summary>Store context of the request (selected store, company-level accounting statement, all stores, missing).</summary>
+    public void StoreResolved(string mode, string reason, string? storeId, string? storeName) => Safe(() =>
+    {
+        _a.Request.StoreMode = mode;
+        _a.Request.StoreReason = Text(reason, 100);
+        _a.Request.StoreId = storeId is null ? null : Text(storeId, 64);
+        _a.Request.StoreName = storeName is null ? null : Text(storeName, 200);
+        AddStage("StoreContext", mode == "Missing" ? "warning" : "ok", null, $"{mode} ({reason}){(storeName is null ? string.Empty : " · " + storeName)}");
+    });
+
+    /// <summary>The question asked for internal details (query, prompt, database…) and got the fixed refusal.</summary>
+    public void RefusedTechnicalDetails() => Safe(() =>
+    {
+        _a.Ai.Intent = "technical-details-request";
+        _a.Ai.ToolSelected = "refused-technical-details";
+        AddStage("Policy", "warning", null, "Request for internal technical details refused");
+    });
+
+    /// <summary>Whether the client response carried technical details (developer/admin dashboard only).</summary>
+    public void TechnicalDetailsReturned(bool returned) => Safe(() =>
+    {
+        _a.Response ??= new ActivityResponseInfo();
+        _a.Response.TechnicalDetailsReturned = returned;
     });
 
     public void ResponseFailed(Exception ex, long durationMs) => Safe(() =>
@@ -354,6 +483,7 @@ public sealed class ActivityRecorder
         _a.Response ??= new ActivityResponseInfo();
         _a.Response.DurationMs = durationMs;
         _a.Response.CompletedAt = Now;
+        _a.Ai.ResponseGenerationStatus = "Failed";
         AddStage(ActivityStages.ResponseGeneration, "error", durationMs, Text(ex.Message, 300));
         AddError(ActivityStages.ResponseGeneration, ActivityErrorTypes.ResponseGenerationError, ex.Message, ex);
     });
@@ -394,7 +524,7 @@ public sealed class ActivityRecorder
 
             // Response
             var resp = _a.Response ??= new ActivityResponseInfo();
-            resp.Text = Text(answer);
+            resp.Text = answer; // the exact final response sent to the user
             resp.Status = status.ToString();
             resp.Format = "markdown";
             resp.VisualizationJson = assistant.VisualizationJson;
@@ -415,6 +545,15 @@ public sealed class ActivityRecorder
                 AddError(StageFor(status), TypeFor(status), error ?? status.ToString(), null);
             if (_a.Status is not (ActivityStatuses.Success or ActivityStatuses.NoResults or ActivityStatuses.Unsupported))
                 _a.FailedStage = _a.Errors.LastOrDefault()?.Stage ?? StageFor(status);
+
+            // Generation statuses
+            if (_a.Errors.Any(e => e.Stage == ActivityStages.QueryGeneration || (e.Stage == ActivityStages.AIProvider && _a.Ai.QueryGenerationStatus == "NotRun")))
+                _a.Ai.QueryGenerationStatus = "Failed";
+            if (_a.Ai.ResponseGenerationStatus is "NotRun" or "Running")
+                _a.Ai.ResponseGenerationStatus = _a.Ai.ResponseGenerationStatus == "Running" ? "Failed" : "Skipped";
+            if (_a.Ai.ToolSelected == "none" && _a.Query?.Operation is not null) _a.Ai.ToolSelected = "database-query";
+            _a.Ai.GenerationStatus = _a.Status is ActivityStatuses.Success or ActivityStatuses.NoResults ? "Completed"
+                : _a.Status == ActivityStatuses.Unsupported ? "Declined" : "Failed";
 
             // Performance
             var p = _a.Performance;
@@ -451,6 +590,8 @@ public sealed class ActivityRecorder
                     Provider = _a.Ai.ProviderName,
                     Model = _a.Ai.Model
                 };
+
+            if (_options.EncryptPayloads && _protector is not null) EncryptPayloads(_protector);
 
             if (!_sink!.TryEnqueue(_a, conversation))
                 _logger.LogWarning("Activity {ActivityId} (correlation {CorrelationId}) was dropped: the activity queue is full", _a.ActivityId, _a.CorrelationId);
@@ -494,11 +635,13 @@ public sealed class ActivityRecorder
         q.Collection = query.Collection;
         q.Operation = query.Operation;
         var json = query.ToJson();
-        if (q.Kind != "combined") q.GeneratedQueryJson = ActivityRedactor.RedactJsonString(json, _sensitive, _options.MaximumTextLength);
-        q.PipelineJson = ActivityRedactor.RedactJsonString(query.Pipeline, _sensitive, _options.MaximumTextLength);
-        q.FilterJson = ActivityRedactor.RedactJsonString(query.Filter, _sensitive, _options.MaximumTextLength);
-        q.ProjectionJson = ActivityRedactor.RedactJsonString(query.Projection, _sensitive, _options.MaximumTextLength);
-        q.SortJson = ActivityRedactor.RedactJsonString(query.Sort, _sensitive, _options.MaximumTextLength);
+        // The query is stored exactly as generated (not redacted, not shortened) so it can be re-run and audited.
+        if (q.Kind != "combined") q.GeneratedQueryJson = json.ToCompact();
+        q.PipelineJson = query.Pipeline?.ToCompact();
+        q.FilterJson = query.Filter?.ToCompact();
+        q.ProjectionJson = query.Projection?.ToCompact();
+        q.SortJson = query.Sort?.ToCompact();
+        if (q.Stages.Count == 0) q.Stages = StageNames(query.Pipeline);
         q.Limit = query.Limit;
         // Hash only the executable part (not the explanation text), so identical queries group together.
         var hashable = new JsonObject { ["operation"] = query.Operation, ["collection"] = query.Collection };
@@ -511,7 +654,7 @@ public sealed class ActivityRecorder
         q.QueryHash = "sha256:" + ActivityHashing.Sha256(hashable.ToCompact());
         if (!string.IsNullOrWhiteSpace(query.Explanation)) _a.Ai.Explanation = Text(query.Explanation, 2000);
         if (!string.IsNullOrWhiteSpace(query.Visualization)) _a.Ai.VisualizationHint = query.Visualization;
-        if (!query.IsUnsupported && q.Kind == "query") _a.Ai.Intent = $"database:{query.Operation}";
+        if (!query.IsUnsupported && !query.IsClarification && q.Kind == "query") { _a.Ai.Intent = $"database:{query.Operation}"; _a.Ai.ToolSelected = "database-query"; }
         else if (q.Kind == "combined") _a.Ai.Intent = "attachment:combined";
     }
 
@@ -538,6 +681,57 @@ public sealed class ActivityRecorder
     }
 
     private string Text(string? text, int? max = null) => ActivityRedactor.RedactText(text, max ?? _options.MaximumTextLength);
+
+    /// <summary>Exact text (no redaction); only a safety bound far above any real model output.</summary>
+    private static string Exact(string? text) => text is null ? string.Empty : text.Length <= ExactLimit ? text : ActivityRedactor.Truncate(text, ExactLimit);
+
+    private static List<string> StageNames(JsonArray? pipeline)
+        => pipeline?.OfType<JsonObject>().Select(o => o.FirstOrDefault().Key).Where(k => !string.IsNullOrEmpty(k)).ToList() ?? new List<string>();
+
+    /// <summary>Encrypts the technical payloads (MQL, raw model output, rejected query, stored rows) at rest.</summary>
+    private void EncryptPayloads(ISecretProtector protector)
+    {
+        string? Enc(string? v) => string.IsNullOrEmpty(v) ? v : protector.Protect(v);
+        if (_a.Query is { } q)
+        {
+            q.GeneratedQueryJson = Enc(q.GeneratedQueryJson);
+            q.PipelineJson = Enc(q.PipelineJson);
+            q.FilterJson = Enc(q.FilterJson);
+            q.ProjectionJson = Enc(q.ProjectionJson);
+            q.SortJson = Enc(q.SortJson);
+            q.ExecutedMql = Enc(q.ExecutedMql);
+            q.ExecutedPipelineJson = Enc(q.ExecutedPipelineJson);
+            q.QueryParametersJson = Enc(q.QueryParametersJson);
+            foreach (var t in q.Attempts) t.RawOutput = Enc(t.RawOutput);
+        }
+        if (_a.Validation is { } v) v.RejectedQueryJson = Enc(v.RejectedQueryJson);
+        if (_a.Result is { } r) r.DataJson = Enc(r.DataJson);
+        _a.PayloadEncryption = PayloadEncryptionScheme;
+    }
+
+    public const string PayloadEncryptionScheme = "dataprotection-v1";
+
+    /// <summary>Reverses <see cref="EncryptPayloads"/> for the admin API. Unreadable values are replaced by a marker.</summary>
+    public static void DecryptPayloads(AIActivity a, ISecretProtector protector)
+    {
+        if (a.PayloadEncryption != PayloadEncryptionScheme) return;
+        string? Dec(string? v) => string.IsNullOrEmpty(v) ? v : protector.Unprotect(v) ?? "[encrypted — key not available on this server]";
+        if (a.Query is { } q)
+        {
+            q.GeneratedQueryJson = Dec(q.GeneratedQueryJson);
+            q.PipelineJson = Dec(q.PipelineJson);
+            q.FilterJson = Dec(q.FilterJson);
+            q.ProjectionJson = Dec(q.ProjectionJson);
+            q.SortJson = Dec(q.SortJson);
+            q.ExecutedMql = Dec(q.ExecutedMql);
+            q.ExecutedPipelineJson = Dec(q.ExecutedPipelineJson);
+            q.QueryParametersJson = Dec(q.QueryParametersJson);
+            foreach (var t in q.Attempts) t.RawOutput = Dec(t.RawOutput);
+        }
+        if (a.Validation is { } v) v.RejectedQueryJson = Dec(v.RejectedQueryJson);
+        if (a.Result is { } r) r.DataJson = Dec(r.DataJson);
+        a.PayloadEncryption = null;
+    }
 
     private static string? Clip(string? s, int max) => string.IsNullOrWhiteSpace(s) ? null : ActivityRedactor.RedactText(s.Trim(), max);
 

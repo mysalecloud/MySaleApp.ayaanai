@@ -219,6 +219,12 @@ public interface IConversationRepository
 {
     Task<List<Conversation>> ListAsync(string userId, string companyId, string? search, bool? archived, int limit, CancellationToken ct);
     Task<Conversation?> GetAsync(string id, string userId, string companyId, CancellationToken ct);
+    /// <summary>AI dashboard: every conversation of one tenant (company). companyId is always taken from the token.</summary>
+    Task<(List<Conversation> Items, long Total)> SearchByCompanyAsync(string companyId, string? search, DateTime? from, DateTime? to,
+        int page, int pageSize, CancellationToken ct);
+    /// <summary>AI dashboard: one conversation, only when it belongs to <paramref name="companyId"/>.</summary>
+    Task<Conversation?> GetForCompanyAsync(string id, string companyId, CancellationToken ct);
+    Task<long> CountByCompanyAsync(string companyId, DateTime from, CancellationToken ct);
     Task InsertAsync(Conversation conversation, CancellationToken ct);
     Task UpdateAsync(Conversation conversation, CancellationToken ct);
     Task DeleteAsync(string id, CancellationToken ct);
@@ -292,6 +298,25 @@ public interface ISettingsRepository
 public interface IAuditLogRepository
 {
     Task InsertAsync(AuditLog log, CancellationToken ct);
+    /// <summary>
+    /// AI dashboard: audit entries of ONE tenant (CompanyId or TenantRef must match). Both values come from the token;
+    /// an empty scope returns nothing.
+    /// </summary>
+    Task<(List<AuditLog> Items, long Total)> SearchForTenantAsync(AuditLogFilter filter, CancellationToken ct);
+}
+
+public sealed class AuditLogFilter
+{
+    public string CompanyId { get; set; } = string.Empty;
+    public string TenantRef { get; set; } = string.Empty;
+    /// <summary>Exact action (e.g. "AIDashboard.Denied") or prefix ending with '*'.</summary>
+    public string? Action { get; set; }
+    public string? UserId { get; set; }
+    public string? Search { get; set; }
+    public DateTime? From { get; set; }
+    public DateTime? To { get; set; }
+    public int Page { get; set; } = 1;
+    public int PageSize { get; set; } = 25;
 }
 
 // ---------- Business database management (Database page) ----------

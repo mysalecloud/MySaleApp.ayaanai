@@ -86,12 +86,20 @@ public sealed class UsageService
 
     private string? CompanyScope => _user.Role == UserRole.Admin ? null : _user.CompanyId;
 
-    public async Task<UsageReportDto> GetReportAsync(int days, CancellationToken ct)
+    public Task<UsageReportDto> GetReportAsync(int days, CancellationToken ct) => BuildReportAsync(days, CompanyScope, ct);
+
+    /// <summary>Usage of exactly one tenant (AI dashboard in MySaleBooks). <paramref name="companyId"/> must come from the token.</summary>
+    public Task<UsageReportDto> GetTenantReportAsync(int days, string companyId, CancellationToken ct)
+        => string.IsNullOrEmpty(companyId)
+            ? throw new ArgumentException("A tenant is required.", nameof(companyId))
+            : BuildReportAsync(days, companyId, ct);
+
+    private async Task<UsageReportDto> BuildReportAsync(int days, string? companyScope, CancellationToken ct)
     {
         days = Math.Clamp(days, 1, 365);
         var anchors = DateAnchors.Compute(_time.GetUtcNow().UtcDateTime, _user.TimeZone);
         var from = anchors.Today.StartUtc.AddDays(-(days - 1));
-        var rows = await _logs.GetUsageRowsAsync(from, anchors.NowUtc.AddMinutes(1), CompanyScope, ct);
+        var rows = await _logs.GetUsageRowsAsync(from, anchors.NowUtc.AddMinutes(1), companyScope, ct);
 
         return new UsageReportDto
         {

@@ -59,6 +59,8 @@ public sealed class AIActivity : Entity
     public string? UserMessageId { get; set; }
     public string? QueryLogId { get; set; }
     public string? UserId { get; set; }
+    /// <summary>Display name of the user (for the AI dashboard). Never a token or e-mail secret.</summary>
+    public string? UserName { get; set; }
     /// <summary>Hashed tenant reference (customer database / company). Never the raw database name.</summary>
     public string TenantRef { get; set; } = string.Empty;
     public string AuthSource { get; set; } = "agent";
@@ -82,6 +84,15 @@ public sealed class AIActivity : Entity
     public List<ActivityErrorInfo> Errors { get; set; } = new();
     public ActivityPerformance Performance { get; set; } = new();
     public List<ActivityStageEntry> Timeline { get; set; } = new();
+
+    /// <summary>
+    /// Null = stored in plain text. "dataprotection-v1" = the MQL, raw model output, rejected query and stored rows are
+    /// encrypted with ASP.NET Core Data Protection (Activity:EncryptPayloads); the admin API decrypts them.
+    /// </summary>
+    public string? PayloadEncryption { get; set; }
+
+    /// <summary>The request id (same value as <see cref="ActivityId"/>).</summary>
+    public string RequestId => ActivityId;
 }
 
 public sealed class ActivityRequestInfo
@@ -101,6 +112,11 @@ public sealed class ActivityRequestInfo
     public string? SessionId { get; set; }
     public bool Streamed { get; set; }
     public bool Regenerated { get; set; }
+    /// <summary>Store context: Selected | AllStores | None | Missing, why, and the selected store (MySaleBooks "Store Location").</summary>
+    public string? StoreMode { get; set; }
+    public string? StoreReason { get; set; }
+    public string? StoreId { get; set; }
+    public string? StoreName { get; set; }
 }
 
 public sealed class ActivityAiInfo
@@ -134,6 +150,20 @@ public sealed class ActivityAiInfo
     public string? VisualizationHint { get; set; }
     /// <summary>Reason returned with an "unsupported" answer.</summary>
     public string? DeclineReason { get; set; }
+
+    /// <summary>Action chosen for the request: "database-query" | "attachment-answer" | "attachment-table" |
+    /// "attachment+database" | "declined" | "refused-technical-details" | "none".</summary>
+    public string ToolSelected { get; set; } = "none";
+    /// <summary>"NotRun" | "Generated" | "Unparseable" | "Declined" | "Failed"</summary>
+    public string QueryGenerationStatus { get; set; } = "NotRun";
+    /// <summary>"NotRun" | "Generated" | "Failed" | "Skipped" (fixed reply without an AI answer, e.g. no rows / blocked)</summary>
+    public string ResponseGenerationStatus { get; set; } = "NotRun";
+    /// <summary>Overall: "Completed" | "Failed" | "NotRun".</summary>
+    public string GenerationStatus { get; set; } = "NotRun";
+    /// <summary>Collections offered to the model (allowed schema) — the schema context of this request.</summary>
+    public List<string> SchemaCollections { get; set; } = new();
+    /// <summary>SHA-256 prefix of the schema context (collection + field names) — identifies the exact schema version used.</summary>
+    public string? SchemaContextRef { get; set; }
 }
 
 public sealed class ActivityQueryInfo
@@ -147,8 +177,18 @@ public sealed class ActivityQueryInfo
     public string? ProjectionJson { get; set; }
     public string? SortJson { get; set; }
     public int? Limit { get; set; }
-    /// <summary>Validated + tenant-scoped pipeline that was sent to MongoDB (shell syntax).</summary>
+    /// <summary>Validated + tenant-scoped pipeline that was sent to MongoDB (shell syntax), complete.</summary>
     public string? ExecutedMql { get; set; }
+    /// <summary>The exact pipeline sent to MongoDB as Extended JSON (every stage, not truncated).</summary>
+    public string? ExecutedPipelineJson { get; set; }
+    /// <summary>When the first query returned no rows and was retried with tolerant text matching: the first executed MQL (exact).</summary>
+    public string? InitialExecutedMql { get; set; }
+    /// <summary>Fields whose exact text match was made case-/space-insensitive in the retry.</summary>
+    public List<string> RelaxedFields { get; set; } = new();
+    /// <summary>Stage operators of the executed pipeline in order, e.g. ["$match","$lookup","$group","$sort","$limit"].</summary>
+    public List<string> Stages { get; set; } = new();
+    /// <summary>Server-side query parameters: tenant scope, max records, timeout, date anchors, repair attempts…</summary>
+    public string? QueryParametersJson { get; set; }
     /// <summary>Raw model output of every attempt (redacted, truncated).</summary>
     public List<ActivityQueryAttempt> Attempts { get; set; } = new();
     public DateTime? GeneratedAt { get; set; }
@@ -203,6 +243,12 @@ public sealed class ActivityExecutionInfo
     public string? Error { get; set; }
     /// <summary>MongoDB comment attached to the command ("ayaan:{correlationId}") — find it in the profiler.</summary>
     public string? Comment { get; set; }
+    /// <summary>Server time limit (maxTimeMS) applied to the query.</summary>
+    public int TimeoutLimitMs { get; set; }
+    /// <summary>Document cap requested from MongoDB (max records + 1 to detect truncation).</summary>
+    public int MaxDocuments { get; set; }
+    /// <summary>Execution retries (the agent does not retry a MongoDB query; repairs happen before execution).</summary>
+    public int Retries { get; set; }
 }
 
 public sealed class ActivityResultInfo
@@ -224,7 +270,12 @@ public sealed class ActivityResultInfo
 
 public sealed class ActivityResponseInfo
 {
+    /// <summary>The exact final response sent to the user.</summary>
     public string Text { get; set; } = string.Empty;
+    /// <summary>The raw answer returned by the AI model (before the final trim / fallback), when an AI answer was generated.</summary>
+    public string? AiGeneratedText { get; set; }
+    /// <summary>True when the response to the client included technical details (developer/admin dashboard only).</summary>
+    public bool TechnicalDetailsReturned { get; set; }
     public string Format { get; set; } = "markdown";
     public string? VisualizationType { get; set; }
     /// <summary>Visualization spec (KPI / chart / table config) as returned to the client.</summary>

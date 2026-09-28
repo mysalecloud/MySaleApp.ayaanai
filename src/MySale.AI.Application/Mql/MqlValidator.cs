@@ -16,6 +16,14 @@ public sealed class MqlValidationContext
     public int MaxLookups { get; init; } = 3;
     public int MaxNodes { get; init; } = 4000;
     public int MaxRegexLength { get; init; } = 200;
+    /// <summary>Store context of the request (selected MySaleBooks store). Null = no store filtering.</summary>
+    public Stores.StoreScope? Store { get; init; }
+    /// <summary>Business time zone and the days typed in the question (date literals are read with these).</summary>
+    public DateCoercionContext? Dates { get; init; }
+    /// <summary>The user's question (used to allow createdAt-style fields when the user asks about creation).</summary>
+    public string? Question { get; init; }
+    /// <summary>Configured business date field per collection (Business:BusinessDateFields).</summary>
+    public IReadOnlyDictionary<string, string>? BusinessDateFields { get; init; }
 }
 
 public sealed class MqlValidationResult
@@ -76,9 +84,9 @@ public sealed class MqlValidator
 
         public void Validate(MqlQuery q)
         {
-            if (q.IsUnsupported)
+            if (q.IsUnsupported || q.IsClarification)
             {
-                Error("The model marked the question as unsupported.");
+                Error(q.IsClarification ? "The model asked for a clarification instead of a query." : "The model marked the question as unsupported.");
                 return;
             }
 

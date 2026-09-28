@@ -127,9 +127,13 @@ public sealed class HmacTokenService : ITokenService
         return new IssuedToken($"{head}.{body}.{signature}", expires.UtcDateTime);
     }
 
-    public bool TryValidate(string token, out TokenPayload? payload)
+    public bool TryValidate(string token, out TokenPayload? payload) => TryValidate(token, out payload, out _);
+
+    /// <summary>Same validation; <paramref name="expired"/> tells an expired (but otherwise genuine) token apart from an invalid one.</summary>
+    public bool TryValidate(string token, out TokenPayload? payload, out bool expired)
     {
         payload = null;
+        expired = false;
         if (_key is null) return false;
         var parts = token.Split('.');
         if (parts.Length != 3) return false;
@@ -149,7 +153,9 @@ public sealed class HmacTokenService : ITokenService
             return false;
         }
         if (payload is null || payload.Issuer != _options.Issuer) return false;
-        return payload.ExpiresAt > _time.GetUtcNow().ToUnixTimeSeconds();
+        if (payload.ExpiresAt > _time.GetUtcNow().ToUnixTimeSeconds()) return true;
+        expired = true;
+        return false;
     }
 
     private byte[] Sign(string data)

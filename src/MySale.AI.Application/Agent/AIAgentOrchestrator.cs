@@ -10,6 +10,7 @@ using MySale.AI.Application.Common;
 using MySale.AI.Application.Contracts;
 using MySale.AI.Application.Mql;
 using MySale.AI.Application.Services;
+using MySale.AI.Application.Stores;
 using MySale.AI.Domain;
 
 namespace MySale.AI.Application.Agent;
@@ -117,6 +118,9 @@ public sealed class AIAgentOrchestrator
     private readonly AttachmentService? _attachments;
     private readonly ModelCapabilityService? _capabilities;
     private readonly ActivityTracker? _activity;
+    private readonly StoreContextResolver? _stores;
+    private readonly BusinessCalendarOptions _calendar;
+    private readonly BusinessTermOptions _terms;
 
     public AIAgentOrchestrator(
         IConversationRepository conversations,
@@ -132,9 +136,15 @@ public sealed class AIAgentOrchestrator
         ILogger<AIAgentOrchestrator> logger,
         AttachmentService? attachments = null,
         ModelCapabilityService? capabilities = null,
-        ActivityTracker? activity = null)
+        ActivityTracker? activity = null,
+        StoreContextResolver? stores = null,
+        BusinessCalendarOptions? calendar = null,
+        BusinessTermOptions? terms = null)
     {
+        _calendar = calendar ?? new BusinessCalendarOptions();
+        _terms = terms ?? new BusinessTermOptions();
         _activity = activity;
+        _stores = stores;
         _attachments = attachments;
         _capabilities = capabilities;
         _conversations = conversations;
@@ -169,6 +179,11 @@ public sealed class AIAgentOrchestrator
     private async Task<ChatResponse> RunCoreAsync(ChatRequest request, IChatEventSink sink, ActivityRecorder activity, CancellationToken ct)
     {
         var total = Stopwatch.StartNew();
+        // Technical details (MQL, pipeline, collections, trace) only for AI-dashboard developers/admins — never customers.
+        // The complete interaction, including the exact MQL, is always stored in the activity log.
+        var showTechnical = TechnicalDetailsPolicy.CanSeeTechnicalDetails(_user, _activity?.Options.AllowMySaleBooksAdmins ?? false);
+        QueryInfoDto QueryInfoFor(ChatMessage m)
+            => showTechnical ? MessageMapper.ToQueryInfo(m) : TechnicalDetailsPolicy.ForCustomer(MessageMapper.ToQueryInfo(m));
         var stage = ActivityStages.Request;
         var settings = await _settings.GetAsync(ct);
         var persist = settings.Chat.SaveConversations;
@@ -256,11 +271,23 @@ public sealed class AIAgentOrchestrator
 
         ResolvedProvider? provider = null;
         PromptContext promptContext = null!;
+        StoreScope? storeScope = null;
+        QuestionDates questionDates = new();
+        PreparedQuery? lastPrepared = null;
+        SemanticInterpretation semantics = new();
         var attachmentContext = new AttachmentContext(attachmentsCurrent, attachmentsEarlier);
         ModelCapabilities? capabilities = null;
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeout.CancelAfter(TimeSpan.FromSeconds(Math.Max(10, settings.Ai.TimeoutSeconds)));
         var token = timeout.Token;
+
+        // "Show me the query you used" / system prompt / database names → fixed refusal (no AI call, nothing internal returned).
+        if (attachmentsCurrent.Count == 0 && TechnicalDetailsPolicy.IsTechnicalDetailsRequest(question))
+        {
+            activity.RefusedTechnicalDetails();
+            trace.Add("policy", "Technical details request", "Refused: the question asks for internal queries or system details.", "warning");
+            return await FinishAsync(ChatStatus.Unsupported, TechnicalDetailsPolicy.RefusalMessage, "Technical details request refused");
+        }
 
         try
         {
@@ -277,11 +304,64 @@ public sealed class AIAgentOrchestrator
             // 3. Schema
             stage = ActivityStages.Prompt;
             var schema = await _engine.GetAllowedSchemaAsync(settings, token);
+            activity.SetSchema(schema);
             if (schema.Count == 0)
                 throw new QueryExecutionException("No collections are available for querying. Check the Database and Settings pages.");
 
-            var anchors = DateAnchors.Compute(now, _user.TimeZone);
-            promptContext = new PromptContext(_user.CompanyName, _user.Currency, _user.TimeZone, anchors, settings.Query.MaxRecords, _engine.TenantField);
+            var anchors = DateAnchors.Compute(now, _user.TimeZone, _calendar.FinancialYearStartMonth);
+
+            // 3. Dates typed in the question (01/09/2026, Sep 1 to Sep 15 …) are resolved here, in the business locale.
+            questionDates = QuestionDates.Parse(question, anchors.LocalToday, _calendar.DateOrder);
+            if (!questionDates.IsEmpty)
+                trace.Add("dates", "Dates in the question",
+                    string.Join("\n", questionDates.Spans.Select(s => $"\"{s.Text}\" → {QuestionDates.Describe(s.From)} … {QuestionDates.Describe(s.To)} (inclusive)"))
+                    + (questionDates.Invalid.Count > 0 ? "\nInvalid: " + string.Join(", ", questionDates.Invalid) : string.Empty)
+                    + (questionDates.Ambiguous.Count > 0 ? "\nAmbiguous: " + string.Join(", ", questionDates.Ambiguous.Select(a => a.Text)) : string.Empty),
+                    questionDates.Invalid.Count + questionDates.Ambiguous.Count > 0 ? "warning" : "ok");
+            if (questionDates.Invalid.Count > 0)
+                return await FinishAsync(ChatStatus.Unsupported,
+                    $"\"{questionDates.Invalid[0]}\" isn't a valid date. Please check it and try again.", "Invalid date in the question");
+            if (questionDates.Ambiguous.FirstOrDefault() is { } ambiguous)
+                return await FinishAsync(ChatStatus.Unsupported,
+                    $"Did you mean {QuestionDates.Describe(ambiguous.DayFirst)} or {QuestionDates.Describe(ambiguous.MonthFirst)} for \"{ambiguous.Text}\"? Please write the date like 1 September 2026.",
+                    "Ambiguous date in the question");
+
+            // 3a. Store context: selected MySaleBooks store (verified), company-level accounting statements, all stores.
+            storeScope = _stores is null ? null : await _stores.ResolveAsync(question, settings, token);
+            if (storeScope is not null)
+            {
+                trace.Add("store", "Store context", $"{storeScope.Mode} ({storeScope.Reason}){(storeScope.StoreName is { Length: > 0 } sn ? " · " + sn : string.Empty)}",
+                    storeScope.Mode == StoreMode.Missing ? "warning" : "ok");
+                activity.StoreResolved(storeScope.Mode.ToString(), storeScope.Reason, storeScope.StoreId, storeScope.StoreName);
+            }
+            // 3c. Business terms: user language → business entity → accounting concept → collections / group fields /
+            //     stored group values of THIS database ("customer" → Sundry Debtors → Ledgers.groupName "SUNDRY DEBTORS").
+            semantics = BusinessTerms.Interpret(question, schema, _terms);
+            if (semantics.Clarification is { } clarification && !attachmentContext.Any)
+            {
+                trace.Add("businessTerms", "Business terms", semantics.Describe(), "warning");
+                activity.Clarification(clarification);
+                return await FinishAsync(ChatStatus.Unsupported, clarification, "Clarification needed: ambiguous business entity");
+            }
+            if (semantics.Mappings.Count > 0)
+            {
+                var termsSw = Stopwatch.StartNew();
+                var groupLookups = _terms.VerifyGroupValues ? await ReadStoredGroupValuesAsync(semantics, schema, settings, token) : 0;
+                termsSw.Stop();
+                trace.Add("businessTerms", "Business terms", semantics.Describe(), "ok", termsSw.ElapsedMilliseconds);
+                // Only database lookups count as MongoDB time in the activity performance breakdown.
+                activity.TermsResolved(semantics.Describe(), groupLookups > 0 ? termsSw.ElapsedMilliseconds : null);
+            }
+
+            promptContext = new PromptContext(_user.CompanyName, _user.Currency, _user.TimeZone, anchors, settings.Query.MaxRecords, _engine.TenantField)
+            {
+                Semantics = semantics,
+                StoreMode = storeScope?.Mode.ToString(),
+                StoreName = storeScope?.StoreName,
+                AccountingStatement = storeScope?.AccountingStatement == true,
+                QuestionDates = questionDates,
+                BusinessDateFields = _calendar.BusinessDateFields
+            };
 
             // 3b. Attachments: read images with a vision model (cached), describe files to the planner
             if (attachmentContext.Any && _attachments is not null && _capabilities is not null)
@@ -317,7 +397,14 @@ public sealed class AIAgentOrchestrator
             trace.Add("queryPrompt", "Generated prompt", PromptBuilder.Render(messages));
             activity.SetPrompt(messages);
 
-            var validationContext = _engine.CreateContext(schema, settings);
+            var validationContext = _engine.CreateContext(schema, settings, storeScope,
+                new DateCoercionContext
+                {
+                    TimeZone = DateAnchors.ResolveTimeZone(_user.TimeZone),
+                    InclusiveEndDays = questionDates.InclusiveEndDays,
+                    MentionedDays = questionDates.MentionedDays
+                },
+                question, _calendar.BusinessDateFields);
             PreparedQuery? prepared = null;
             MqlQuery? query = null;
             AttachmentPlan? attachmentPlan = null;
@@ -386,7 +473,7 @@ public sealed class AIAgentOrchestrator
                 else
                 {
                     query = parsed.Query!;
-                    if (query.IsUnsupported) break;
+                    if (query.IsUnsupported || query.IsClarification) break;
 
                     await sink.OnStatusAsync("validating", "Validating the query…", token);
                     var validationSw = Stopwatch.StartNew();
@@ -399,7 +486,7 @@ public sealed class AIAgentOrchestrator
                             ? "✓ Passed" + (prepared.Validation.Warnings.Count > 0 ? "\nWarnings:\n- " + string.Join("\n- ", prepared.Validation.Warnings) : string.Empty)
                             : (prepared.Validation.Blocked ? "⛔ Blocked\n- " : "✗ Failed\n- ") + string.Join("\n- ", errors),
                         prepared.Validation.IsValid ? "ok" : "error");
-                    if (prepared.IsExecutable) break;
+                    if (prepared.IsExecutable || prepared.StoreContextMissing) break; // no store → no repair, ask for a store
                 }
 
                 if (attempt >= settings.Ai.MaxRepairAttempts) break;
@@ -410,6 +497,12 @@ public sealed class AIAgentOrchestrator
 
             assistant.RepairAttempts = attempt;
             log.RepairAttempts = attempt;
+
+            if (prepared?.StoreContextMissing == true)
+            {
+                trace.Add("store", "Store required", $"The query needs the selected store ({storeScope?.Reason}); nothing was run.", "warning");
+                return await FinishAsync(ChatStatus.Unsupported, StoreScope.MissingMessage, "Store context missing: " + storeScope?.Reason);
+            }
 
             if (attachmentPlan is not null)
             {
@@ -429,7 +522,7 @@ public sealed class AIAgentOrchestrator
                         assistant.Mql = log.FinalMql = $"table({target.FileName}) " + attachmentPlan.Table!.ToIndented();
                         assistant.QueryJson = JsonSerializer.Serialize(new { type = "table", attachment = planTarget.Alias, table = attachmentPlan.Table }, MessageMapper.Web);
                         trace.Add("tableQuery", "Table calculation (server-side)", assistant.Mql, "ok");
-                        await sink.OnQueryAsync(MessageMapper.ToQueryInfo(assistant), token);
+                        await sink.OnQueryAsync(QueryInfoFor(assistant), token);
                         var (rows, columns) = ResultShaper.Shape(tableResult!.Rows);
                         return await AnswerFromRowsAsync(rows, columns, false, attachmentPlan.Explanation + $" (from {target.FileName}, {tableResult.MatchedRows} matching rows)", attachmentPlan.Visualization, 0);
                     }
@@ -442,6 +535,14 @@ public sealed class AIAgentOrchestrator
                             $"{planTarget!.Attachment.FileName} · column {attachmentPlan.Column} · {tableResult!.Rows.Count} distinct value(s) injected into the query", "ok");
                         break;
                 }
+            }
+
+            if (query is { IsClarification: true })
+            {
+                var askBack = SafeClarification(query.Reason, schema);
+                activity.Clarification(askBack);
+                trace.Add("clarify", "Clarification requested", query.Reason ?? string.Empty, "warning");
+                return await FinishAsync(ChatStatus.Unsupported, askBack, "Clarification needed");
             }
 
             if (query is { IsUnsupported: true })
@@ -465,7 +566,7 @@ public sealed class AIAgentOrchestrator
                 activity.Rejected(query, errors, log.Blocked);
                 if (log.Blocked)
                     await _audit.LogAsync("QueryBlocked", $"Question: {question}\nReasons: {string.Join("; ", errors)}", CancellationToken.None);
-                await sink.OnQueryAsync(MessageMapper.ToQueryInfo(assistant), token);
+                await sink.OnQueryAsync(QueryInfoFor(assistant), token);
                 // Friendly message for the user; the technical reasons stay in the query log / developer trace.
                 return await FinishAsync(ChatStatus.InvalidQuery, UserMessages.BlockedQuery(question), string.Join(" ", errors));
             }
@@ -475,14 +576,33 @@ public sealed class AIAgentOrchestrator
             assistant.Mql = log.FinalMql = prepared.Mql;
             assistant.ValidationErrors = prepared.Validation.Warnings;
             trace.Add("mongoQuery", "MongoDB query (validated + tenant-scoped)", prepared.Mql ?? string.Empty, "ok");
-            activity.Approved(prepared);
-            await sink.OnQueryAsync(MessageMapper.ToQueryInfo(assistant), token);
+            activity.Approved(prepared, new
+            {
+                tenantScope = _user.TenantIsDatabase ? "customer-database" : "company-filter",
+                tenantField = _user.TenantIsDatabase ? null : _engine.TenantField,
+                maxRecords = settings.Query.MaxRecords,
+                maxPipelineStages = settings.Query.MaxPipelineStages,
+                timeoutMs = settings.Query.QueryTimeoutMs,
+                repairAttempts = attempt,
+                maxRepairAttempts = settings.Ai.MaxRepairAttempts,
+                timeZone = _user.TimeZone,
+                currency = _user.Currency,
+                dateAnchors = anchors,
+                storeMode = storeScope?.Mode.ToString() ?? "None",
+                storeReason = storeScope?.Reason,
+                storeId = storeScope?.StoreId,
+                storeName = storeScope?.StoreName,
+                storeFilterField = prepared.StoreFilterField
+            });
+            await sink.OnQueryAsync(QueryInfoFor(assistant), token);
+
+            lastPrepared = prepared;
 
             // 7. Execute
             await sink.OnStatusAsync("executing", "Running the query…", token);
             log.Executed = true;
             stage = ActivityStages.MongoExecution;
-            activity.ExecutionStarted(prepared.Validation.Collection, query?.Operation);
+            activity.ExecutionStarted(prepared.Validation.Collection, query?.Operation, settings.Query.QueryTimeoutMs, settings.Query.MaxRecords + 1);
             ExecutedQuery executed;
             try
             {
@@ -494,6 +614,98 @@ public sealed class AIAgentOrchestrator
             catch (OperationCanceledException ex) when (!ct.IsCancellationRequested) { activity.ExecutionFailed(ex, timeout: true); throw; }
             activity.ExecutionSucceeded(executed);
             assistant.QueryExecuted = log.ExecutionSucceeded = true;
+
+            // 7a. No rows? Exact text matches ("SUNDRY DEBTORS" vs stored "Sundry Debtors ") are the usual cause:
+            //     retry once with case-/space-insensitive matching of the same values (validated + tenant-scoped again).
+            if (executed.Rows.Count == 0
+                && _engine.RelaxTextMatches(prepared, validationContext, settings, out var relaxedFields) is { } relaxedQuery)
+            {
+                try
+                {
+                    var retry = await _engine.ExecuteAsync(relaxedQuery, settings, token,
+                        _activity is null ? null : ActivityRecorder.MongoComment(_activity.CorrelationId));
+                    var used = retry.Rows.Count > 0;
+                    trace.Add("textMatchRetry", "Retry with case-insensitive text match",
+                        $"{string.Join(", ", relaxedFields)} → {retry.Rows.Count} row(s)\n{relaxedQuery.Mql}", used ? "ok" : "warning", retry.ElapsedMs);
+                    activity.TextMatchRetried(relaxedQuery, relaxedFields, retry, used);
+                    if (used)
+                    {
+                        prepared = relaxedQuery;
+                        executed = retry;
+                        assistant.QueryJson = prepared.Query.ToJson().ToCompact();
+                        assistant.Mql = log.FinalMql = prepared.Mql;
+                    }
+                }
+                catch (Exception ex) when (ex is QueryExecutionException or QueryTimeoutException)
+                {
+                    _logger.LogInformation("Text-match retry failed: {Error}", ex.Message);
+                    trace.Add("textMatchRetry", "Retry with case-insensitive text match", ex.Message, "error");
+                }
+            }
+
+            // 7c. Still no rows and the question used business terms ("customer list")? Do not conclude "none" yet: ask the
+            //     model once to re-check entity, collection, accounting group (stored spelling), store and dates. The new
+            //     query is validated, store- and tenant-scoped like any other; it is used only when it returns rows.
+            if (executed.Rows.Count == 0 && _terms.RetryOnZeroResults && query is not null && attachmentPlan is null
+                && semantics.Mappings.Any(m => m.Concept.AccountGroups.Count > 0 && m.HasTarget))
+            {
+                try
+                {
+                    await sink.OnStatusAsync("rechecking", "No records yet — re-checking the business mapping…", token);
+                    var recheckMessages = new List<AIChatMessage>(messages)
+                    {
+                        AIChatMessage.Assistant(prepared.Query.ToJson().ToCompact()),
+                        AIChatMessage.User(_prompts.BuildZeroResultRecheckMessage(semantics, StoreNote(storeScope), DatesNote(questionDates)))
+                    };
+                    var recheckSw = Stopwatch.StartNew();
+                    var ai = await provider.Provider.GenerateQueryAsync(new AIChatRequest
+                    {
+                        Messages = recheckMessages, Model = provider.Model, Temperature = provider.Config.Temperature,
+                        MaxTokens = provider.Config.MaxTokens, JsonMode = true
+                    }, token);
+                    recheckSw.Stop();
+                    assistant.AiQueryTimeMs += recheckSw.ElapsedMilliseconds;
+                    AddUsage(assistant, ai);
+                    log.GeneratedMql += "\n\n--- zero-result re-check ---\n" + ai.Text;
+                    activity.QueryGenerated(attempt + 1, ai.Text, recheckSw.ElapsedMilliseconds, ai.Model);
+                    var reParsed = MqlParser.Parse(ai.Text);
+                    var reQuery = reParsed.Success && reParsed.Query is { IsUnsupported: false, IsClarification: false } rq ? rq : null;
+                    var rePrepared = reQuery is null ? null : _engine.Prepare(reQuery, validationContext, settings);
+                    if (rePrepared is { IsExecutable: true } && !string.Equals(rePrepared.Mql, prepared.Mql, StringComparison.Ordinal))
+                    {
+                        var retry = await _engine.ExecuteAsync(rePrepared, settings, token,
+                            _activity is null ? null : ActivityRecorder.MongoComment(_activity.CorrelationId));
+                        var used = retry.Rows.Count > 0;
+                        trace.Add("semanticRetry", "Zero-result re-check (business mapping)",
+                            $"{rePrepared.Validation.Collection} → {retry.Rows.Count} row(s)\n{rePrepared.Mql}", used ? "ok" : "warning", retry.ElapsedMs);
+                        activity.SemanticRetried(rePrepared, retry, used);
+                        if (used)
+                        {
+                            prepared = rePrepared;
+                            query = reQuery!;
+                            executed = retry;
+                            lastPrepared = rePrepared;
+                            assistant.Collection = log.Collection = rePrepared.Validation.Collection ?? reQuery!.Collection;
+                            assistant.Operation = log.Operation = reQuery!.Operation;
+                            assistant.Explanation = reQuery.Explanation;
+                            assistant.QueryJson = prepared.Query.ToJson().ToCompact();
+                            assistant.Mql = log.FinalMql = prepared.Mql;
+                        }
+                    }
+                    else
+                    {
+                        trace.Add("semanticRetry", "Zero-result re-check (business mapping)",
+                            rePrepared is null ? "The model kept or could not improve the query." :
+                            rePrepared.IsExecutable ? "Same query — the mapping was already correct." : "✗ " + string.Join("; ", rePrepared.Validation.Errors),
+                            "info", recheckSw.ElapsedMilliseconds);
+                    }
+                }
+                catch (Exception ex) when (ex is AIProviderException or QueryExecutionException or QueryTimeoutException)
+                {
+                    _logger.LogInformation("Zero-result re-check failed: {Error}", ex.Message);
+                    trace.Add("semanticRetry", "Zero-result re-check (business mapping)", ex.GetType().Name, "error");
+                }
+            }
 
             // 7b. Show names instead of database ids ("supplierId" → supplier name), read-only + tenant-scoped.
             var references = await _engine.ResolveReferencesAsync(prepared, executed, schema, settings, token,
@@ -558,6 +770,21 @@ public sealed class AIAgentOrchestrator
 
         async Task<ChatResponse> AnswerFromRowsAsync(List<JsonObject> rows, List<string> columns, bool truncated, string? explanation, string? vizHint, long elapsedMs)
         {
+            // Zero rows from a valid query: a clear sentence (topic + period), and for totals the real zero row
+            // ("Today's sales are AED 0.00") — never an empty answer. Averages stay null (not available), not 0.
+            ZeroResult? zero = null;
+            if (rows.Count == 0)
+            {
+                zero = ZeroResultPolicy.Describe(question, lastPrepared?.Validation.Pipeline, lastPrepared?.Validation.Collection, questionDates, _user.Currency);
+                if (zero.ZeroRow is { } zeroRow)
+                {
+                    rows = new List<JsonObject> { zeroRow };
+                    columns = zeroRow.Select(kv => kv.Key).ToList();
+                    vizHint = "kpi";
+                }
+                trace.Add("zeroResult", "No matching records", zero.Message + (zero.ZeroRow is null ? string.Empty : "\nTotals: " + zero.ZeroRow.ToJsonString()), "ok");
+            }
+
             assistant.ExecutionTimeMs = log.ExecutionTimeMs = elapsedMs;
             assistant.ResultCount = log.ResultCount = rows.Count;
             activity.SetResult(rows, columns, truncated);
@@ -569,8 +796,13 @@ public sealed class AIAgentOrchestrator
             trace.Add("mongoResult", $"Result ({rows.Count} rows{(truncated ? ", truncated" : string.Empty)})",
                 JsonHelpers.Truncate(dataArray.ToIndented(), 8000), "ok", elapsedMs);
 
-            if (rows.Count == 0)
-                return await FinishAsync(ChatStatus.NoResults, UserMessages.NoResultsFor(question), null);
+            if (zero is not null)
+            {
+                assistant.ResultCount = log.ResultCount = 0;
+                if (zero.ZeroRow is not null)
+                    assistant.VisualizationJson = JsonSerializer.Serialize(VisualizationAdvisor.Decide(rows, columns, vizHint), MessageMapper.Web);
+                return await FinishAsync(ChatStatus.NoResults, zero.Message, null);
+            }
 
             var visualization = VisualizationAdvisor.Decide(rows, columns, vizHint);
             assistant.VisualizationJson = JsonSerializer.Serialize(visualization, MessageMapper.Web);
@@ -636,6 +868,8 @@ public sealed class AIAgentOrchestrator
             try
             {
                 answer = await GenerateAnswerAsync(provider!, answerMessages, sink, assistant, token);
+                if (storeScope?.Note is { Length: > 0 } storeNote) answer = storeNote + "\n\n" + answer;
+                activity.AnswerGenerated(answer);
             }
             catch (AIProviderException ex)
             {
@@ -721,9 +955,12 @@ public sealed class AIAgentOrchestrator
             }
 
             // Activity log: queued for the background writer (never blocks or fails the answer).
+            activity.TechnicalDetailsReturned(showTechnical);
             activity.Complete(status, assistant.Content, error, assistant, log, conversation.MessageCount, persist, total.ElapsedMilliseconds);
 
-            return MessageMapper.ToChatResponse(conversation, userMessage, assistant, settings.Chat.DeveloperMode ? trace : null);
+            var response = MessageMapper.ToChatResponse(conversation, userMessage, assistant,
+                settings.Chat.DeveloperMode && showTechnical ? trace : null);
+            return showTechnical ? response : TechnicalDetailsPolicy.ForCustomer(response);
         }
     }
 
@@ -826,6 +1063,65 @@ public sealed class AIAgentOrchestrator
         log.IsLocalProvider = p.IsLocal;
     }
 
+    /// <summary>Reads how the accounting groups of the question are stored in this company's data (best effort, tenant-scoped).</summary>
+    private async Task<int> ReadStoredGroupValuesAsync(SemanticInterpretation semantics, IReadOnlyList<CollectionSchema> schema, AppSettings settings, CancellationToken ct)
+    {
+        var cache = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        var lookups = 0;
+        foreach (var mapping in semantics.Mappings.Where(m => m.Concept.AccountGroups.Count > 0))
+        {
+            var patterns = mapping.Concept.AccountGroups.Select(BusinessTerms.GroupPattern).ToList();
+            // Group fields in the concept's own collections first (Ledgers.groupName before Items.groupName).
+            var fields = mapping.GroupFields
+                .OrderByDescending(g => mapping.Collections.Contains(g.Collection, StringComparer.OrdinalIgnoreCase))
+                .Take(3);
+            foreach (var field in fields)
+            {
+                if (lookups >= 6) return lookups;
+                var key = field.Collection + "|" + field.Field + "|" + string.Join("|", patterns);
+                if (!cache.TryGetValue(key, out var values))
+                {
+                    lookups++;
+                    values = await _engine.StoredValuesAsync(field.Collection, field.Field, patterns, schema, settings, ct,
+                        _activity is null ? null : ActivityRecorder.MongoComment(_activity.CorrelationId));
+                    cache[key] = values;
+                }
+                if (values.Count > 0) mapping.StoredGroupValues[field] = values;
+            }
+        }
+        return lookups;
+    }
+
+    /// <summary>A clarification the model wrote goes to the user only when it contains no technical details.</summary>
+    internal static string SafeClarification(string? text, IReadOnlyList<CollectionSchema> schema)
+    {
+        const string fallback = "Could you tell me a little more about which records you mean (for example customers, suppliers, items or accounts)?";
+        var t = text?.Trim();
+        if (string.IsNullOrEmpty(t) || t.Length > 300 || t.IndexOfAny(new[] { '{', '}', '$', '[', ']' }) >= 0) return fallback;
+        // Field-like tokens (groupName, CustomerId, sales_date) are internal names.
+        if (System.Text.RegularExpressions.Regex.IsMatch(t, @"\b[a-z]+[A-Z]\w*\b|\b\w+_\w+\b")) return fallback;
+        foreach (var c in schema)
+            if (System.Text.RegularExpressions.Regex.IsMatch(t, @"\b" + System.Text.RegularExpressions.Regex.Escape(c.Name) + @"\b")
+                && c.Name.Any(char.IsUpper) && c.Name.Length > 3 && !IsPlainWord(c.Name))
+                return fallback;
+        return t;
+
+        static bool IsPlainWord(string name) => name.Skip(1).All(char.IsLower); // "Customers" is also an ordinary word
+    }
+
+    private static string? StoreNote(StoreScope? scope) => scope?.Mode switch
+    {
+        StoreMode.Selected => $"The data must stay limited to the selected store{(scope.StoreName is { Length: > 0 } n ? " \"" + n + "\"" : string.Empty)} (the server applies it).",
+        StoreMode.AllStores => "The user asked for all stores.",
+        _ when scope?.AccountingStatement == true => "This is a company-level accounting statement: no store filter.",
+        _ => null
+    };
+
+    private static string? DatesNote(QuestionDates dates)
+        => dates.Spans.Any()
+            ? "Requested period: " + string.Join("; ", dates.Spans.Select(s => s.From == s.To ? QuestionDates.Describe(s.From) : $"{QuestionDates.Describe(s.From)} to {QuestionDates.Describe(s.To)}")) + " (end day included)."
+            : null;
+
     private async Task<Conversation> LoadOrCreateConversationAsync(ChatRequest request, string question, bool persist, CancellationToken ct)
     {
         if (!string.IsNullOrWhiteSpace(request.ConversationId) && persist)
@@ -844,6 +1140,7 @@ public sealed class AIAgentOrchestrator
         {
             UserId = _user.UserId,
             CompanyId = _user.CompanyId,
+            UserName = _user.DisplayName,
             Title = ConversationService.TitleFrom(question)
         };
         if (persist) await _conversations.InsertAsync(conversation, ct);

@@ -63,6 +63,9 @@ public sealed class MongoActivityRepository : IAIActivityRepository
         if (!string.IsNullOrWhiteSpace(f.Provider)) filter &= b.Eq(a => a.Ai.ProviderName, f.Provider);
         if (!string.IsNullOrWhiteSpace(f.Model)) filter &= b.Eq(a => a.Ai.Model, f.Model);
         if (!string.IsNullOrWhiteSpace(f.TenantRef)) filter &= b.Eq(a => a.TenantRef, f.TenantRef);
+        if (!string.IsNullOrWhiteSpace(f.UserId)) filter &= b.Eq(a => a.UserId, f.UserId);
+        if (!string.IsNullOrWhiteSpace(f.Action)) filter &= b.Eq(a => a.Ai.ToolSelected, f.Action);
+        if (!string.IsNullOrWhiteSpace(f.InputType)) filter &= b.Eq(a => a.Request.InputType, f.InputType);
         if (!string.IsNullOrWhiteSpace(f.Search))
         {
             var term = f.Search.Trim();
@@ -88,17 +91,22 @@ public sealed class MongoActivityRepository : IAIActivityRepository
     public async Task<AIActivity?> GetAsync(string activityId, CancellationToken ct)
         => await Activities.Find(a => a.ActivityId == activityId).FirstOrDefaultAsync(ct);
 
-    public Task<List<AIActivity>> ListByConversationAsync(string conversationId, int limit, CancellationToken ct)
-        => Activities.Find(a => a.ConversationId == conversationId).SortBy(a => a.Timestamp).Limit(limit).ToListAsync(ct);
+    public Task<List<AIActivity>> ListByConversationAsync(string conversationId, int limit, CancellationToken ct, string? tenantRef = null)
+    {
+        var b = Builders<AIActivity>.Filter;
+        var filter = b.Eq(a => a.ConversationId, conversationId);
+        if (tenantRef is not null) filter &= b.Eq(a => a.TenantRef, tenantRef);
+        return Activities.Find(filter).SortBy(a => a.Timestamp).Limit(limit).ToListAsync(ct);
+    }
 
-    public async Task<(List<AIConversationActivity> Items, long Total)> SearchConversationsAsync(string? search, int page, int pageSize, CancellationToken ct)
+    public async Task<(List<AIConversationActivity> Items, long Total)> SearchConversationsAsync(string? search, int page, int pageSize, CancellationToken ct, string? tenantRef = null)
     {
         var b = Builders<AIConversationActivity>.Filter;
-        var filter = b.Empty;
+        var filter = tenantRef is null ? b.Empty : b.Eq(c => c.TenantRef, tenantRef);
         if (!string.IsNullOrWhiteSpace(search))
         {
             var term = search.Trim();
-            filter = b.Or(
+            filter &= b.Or(
                 b.Eq(c => c.Id, term),
                 b.Regex(c => c.Title, new BsonRegularExpression(Regex.Escape(term[..Math.Min(term.Length, 200)]), "i")));
         }
@@ -111,7 +119,7 @@ public sealed class MongoActivityRepository : IAIActivityRepository
     public async Task<AIConversationActivity?> GetConversationAsync(string conversationId, CancellationToken ct)
         => await Conversations.Find(c => c.Id == conversationId).FirstOrDefaultAsync(ct);
 
-    public async Task<List<string>> DistinctAsync(string field, CancellationToken ct)
+    public async Task<List<string>> DistinctAsync(string field, CancellationToken ct, string? tenantRef = null)
     {
         FieldDefinition<AIActivity, string> path = field switch
         {
@@ -119,17 +127,31 @@ public sealed class MongoActivityRepository : IAIActivityRepository
             "model" => "Ai.Model",
             _ => throw new ArgumentOutOfRangeException(nameof(field))
         };
-        var values = await (await Activities.DistinctAsync(path, Builders<AIActivity>.Filter.Empty, cancellationToken: ct)).ToListAsync(ct);
+        var scope = tenantRef is null ? Builders<AIActivity>.Filter.Empty : Builders<AIActivity>.Filter.Eq(a => a.TenantRef, tenantRef);
+        var values = await (await Activities.DistinctAsync(path, scope, cancellationToken: ct)).ToListAsync(ct);
         return values.Where(v => !string.IsNullOrEmpty(v)).OrderBy(v => v).ToList();
     }
 
-    public Task<List<AIActivity>> RecentForStatsAsync(DateTime from, int limit, CancellationToken ct)
-        => Activities.Find(a => a.Timestamp >= from)
+    public Task<List<AIActivity>> RecentForStatsAsync(DateTime from, int limit, CancellationToken ct, string? tenantRef = null)
+        => Activities.Find(tenantRef is null
+                ? Builders<AIActivity>.Filter.Gte(a => a.Timestamp, from)
+                : Builders<AIActivity>.Filter.Gte(a => a.Timestamp, from) & Builders<AIActivity>.Filter.Eq(a => a.TenantRef, tenantRef))
             .Project<AIActivity>(Builders<AIActivity>.Projection
                 .Include(a => a.Status).Include(a => a.FailedStage).Include(a => a.Performance).Include(a => a.Timestamp))
             .SortByDescending(a => a.Timestamp)
             .Limit(limit)
             .ToListAsync(ct);
+
+    public Task<List<AIActivity>> RecentForAnalysisAsync(string tenantRef, DateTime from, int limit, CancellationToken ct)
+        => string.IsNullOrEmpty(tenantRef)
+            ? Task.FromResult(new List<AIActivity>())
+            : Activities.Find(Builders<AIActivity>.Filter.Eq(a => a.TenantRef, tenantRef) & Builders<AIActivity>.Filter.Gte(a => a.Timestamp, from))
+                .Project<AIActivity>(Builders<AIActivity>.Projection
+                    .Exclude(a => a.Query).Exclude(a => a.Result).Exclude(a => a.Response).Exclude(a => a.Timeline)
+                    .Exclude("Validation.RejectedQueryJson").Exclude("Errors.StackTrace").Exclude("Errors.Message"))
+                .SortByDescending(a => a.Timestamp)
+                .Limit(Math.Clamp(limit, 1, 20_000))
+                .ToListAsync(ct);
 
     public async Task<long> PurgeOlderThanAsync(DateTime cutoff, CancellationToken ct)
     {

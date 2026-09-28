@@ -89,6 +89,35 @@ public sealed class ConversationRepository : IConversationRepository
             ? await _db.Conversations.Find(c => c.Id == id && c.UserId == userId && c.CompanyId == companyId).FirstOrDefaultAsync(ct)
             : null;
 
+    public async Task<(List<Conversation> Items, long Total)> SearchByCompanyAsync(string companyId, string? search, DateTime? from, DateTime? to,
+        int page, int pageSize, CancellationToken ct)
+    {
+        if (string.IsNullOrEmpty(companyId)) return (new List<Conversation>(), 0); // never "all tenants"
+        var f = Builders<Conversation>.Filter;
+        var filter = f.Eq(c => c.CompanyId, companyId);
+        if (from is { } a) filter &= f.Gte(c => c.UpdatedAt, a.ToUniversalTime());
+        if (to is { } b) filter &= f.Lte(c => c.UpdatedAt, b.ToUniversalTime());
+        if (!string.IsNullOrWhiteSpace(search))
+        {
+            var term = search.Trim();
+            filter &= f.Regex(c => c.Title, new BsonRegularExpression(Regex.Escape(term[..Math.Min(term.Length, 200)]), "i"));
+        }
+        var total = await _db.Conversations.CountDocumentsAsync(filter, cancellationToken: ct);
+        var items = await _db.Conversations.Find(filter).SortByDescending(c => c.UpdatedAt)
+            .Skip((page - 1) * pageSize).Limit(pageSize).ToListAsync(ct);
+        return (items, total);
+    }
+
+    public async Task<Conversation?> GetForCompanyAsync(string id, string companyId, CancellationToken ct)
+        => SystemDbContext.IsObjectId(id) && !string.IsNullOrEmpty(companyId)
+            ? await _db.Conversations.Find(c => c.Id == id && c.CompanyId == companyId).FirstOrDefaultAsync(ct)
+            : null;
+
+    public Task<long> CountByCompanyAsync(string companyId, DateTime from, CancellationToken ct)
+        => string.IsNullOrEmpty(companyId)
+            ? Task.FromResult(0L)
+            : _db.Conversations.CountDocumentsAsync(c => c.CompanyId == companyId && c.UpdatedAt >= from, cancellationToken: ct);
+
     public Task InsertAsync(Conversation conversation, CancellationToken ct)
         => _db.Conversations.InsertOneAsync(conversation, cancellationToken: ct);
 
@@ -241,6 +270,33 @@ public sealed class AuditLogRepository : IAuditLogRepository
     public AuditLogRepository(SystemDbContext db) => _db = db;
 
     public Task InsertAsync(AuditLog log, CancellationToken ct) => _db.AuditLogs.InsertOneAsync(log, cancellationToken: ct);
+
+    public async Task<(List<AuditLog> Items, long Total)> SearchForTenantAsync(AuditLogFilter f, CancellationToken ct)
+    {
+        if (string.IsNullOrEmpty(f.CompanyId) && string.IsNullOrEmpty(f.TenantRef)) return (new List<AuditLog>(), 0);
+        var b = Builders<AuditLog>.Filter;
+        var scopes = new List<FilterDefinition<AuditLog>>();
+        if (!string.IsNullOrEmpty(f.CompanyId)) scopes.Add(b.Eq(l => l.CompanyId, f.CompanyId));
+        if (!string.IsNullOrEmpty(f.TenantRef)) scopes.Add(b.Eq(l => l.TenantRef, f.TenantRef));
+        var filter = b.Or(scopes);
+        if (!string.IsNullOrWhiteSpace(f.Action))
+            filter &= f.Action.EndsWith('*')
+                ? b.Regex(l => l.Action, new BsonRegularExpression("^" + Regex.Escape(f.Action.TrimEnd('*'))))
+                : b.Eq(l => l.Action, f.Action);
+        if (!string.IsNullOrWhiteSpace(f.UserId)) filter &= b.Eq(l => l.UserId, f.UserId);
+        if (f.From is { } from) filter &= b.Gte(l => l.CreatedAt, from.ToUniversalTime());
+        if (f.To is { } to) filter &= b.Lte(l => l.CreatedAt, to.ToUniversalTime());
+        if (!string.IsNullOrWhiteSpace(f.Search))
+        {
+            var term = f.Search.Trim();
+            var rx = new BsonRegularExpression(Regex.Escape(term[..Math.Min(term.Length, 200)]), "i");
+            filter &= b.Or(b.Regex(l => l.Action, rx), b.Regex(l => l.Resource, rx), b.Regex(l => l.UserName, rx), b.Eq(l => l.ResourceId, term));
+        }
+        var total = await _db.AuditLogs.CountDocumentsAsync(filter, cancellationToken: ct);
+        var items = await _db.AuditLogs.Find(filter).SortByDescending(l => l.CreatedAt)
+            .Skip((f.Page - 1) * f.PageSize).Limit(f.PageSize).ToListAsync(ct);
+        return (items, total);
+    }
 }
 
 public sealed class DatabaseConfigStore

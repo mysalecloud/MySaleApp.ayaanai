@@ -37,7 +37,12 @@ public sealed class QuerySandboxService
         var provider = await _providers.ResolveAsync(request.ProviderId, request.Model, settings, ct);
         var schema = await _engine.GetAllowedSchemaAsync(settings, ct);
         var anchors = DateAnchors.Compute(_time.GetUtcNow().UtcDateTime, _user.TimeZone);
-        var ctx = new PromptContext(_user.CompanyName, _user.Currency, _user.TimeZone, anchors, settings.Query.MaxRecords, _engine.TenantField);
+        // Same date handling as the chat: typed dates resolved server-side, literals read in the business time zone.
+        var questionDates = QuestionDates.Parse(request.Question, anchors.LocalToday);
+        var ctx = new PromptContext(_user.CompanyName, _user.Currency, _user.TimeZone, anchors, settings.Query.MaxRecords, _engine.TenantField)
+        {
+            QuestionDates = questionDates
+        };
         var messages = _prompts.BuildQueryMessages(ctx, schema, Array.Empty<ChatMessage>(), request.Question);
 
         var sw = Stopwatch.StartNew();
@@ -72,8 +77,14 @@ public sealed class QuerySandboxService
             return response;
         }
         response.Parsed = parsed.Query!.ToJson();
-        if (!parsed.Query.IsUnsupported)
-            response.Validation = ToDto(_engine.Prepare(parsed.Query, _engine.CreateContext(schema, settings), settings));
+        if (!parsed.Query.IsUnsupported && !parsed.Query.IsClarification)
+            response.Validation = ToDto(_engine.Prepare(parsed.Query, _engine.CreateContext(schema, settings, null,
+                new DateCoercionContext
+                {
+                    TimeZone = DateAnchors.ResolveTimeZone(_user.TimeZone),
+                    InclusiveEndDays = questionDates.InclusiveEndDays,
+                    MentionedDays = questionDates.MentionedDays
+                }, request.Question), settings));
         return response;
     }
 
@@ -121,11 +132,12 @@ public sealed class QuerySandboxService
     {
         var parsed = MqlParser.Parse(queryJson.ToJsonString());
         if (!parsed.Success) return (null, parsed.Error);
-        if (parsed.Query!.IsUnsupported) return (null, "The query is marked as unsupported.");
+        if (parsed.Query!.IsUnsupported || parsed.Query.IsClarification) return (null, "The query is marked as unsupported.");
 
         var settings = await _settings.GetAsync(ct);
         var schema = await _engine.GetAllowedSchemaAsync(settings, ct);
-        return (_engine.Prepare(parsed.Query, _engine.CreateContext(schema, settings), settings), null);
+        var dates = new DateCoercionContext { TimeZone = DateAnchors.ResolveTimeZone(_user.TimeZone) };
+        return (_engine.Prepare(parsed.Query, _engine.CreateContext(schema, settings, null, dates), settings), null);
     }
 
     private static ValidationResultDto ToDto(PreparedQuery p) => new()

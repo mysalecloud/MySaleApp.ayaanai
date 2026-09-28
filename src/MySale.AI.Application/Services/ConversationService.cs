@@ -37,6 +37,7 @@ public sealed class ConversationService
         {
             UserId = _user.UserId,
             CompanyId = _user.CompanyId,
+            UserName = _user.DisplayName,
             Title = string.IsNullOrWhiteSpace(title) ? "New conversation" : title.Trim()
         };
         await _conversations.InsertAsync(c, ct);

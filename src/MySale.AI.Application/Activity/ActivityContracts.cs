@@ -71,6 +71,10 @@ public sealed class ActivityFilter
     public string? Provider { get; set; }
     public string? Model { get; set; }
     public string? TenantRef { get; set; }
+    /// <summary>AI dashboard filters: user id, action (tool selected), input type (text / voice …).</summary>
+    public string? UserId { get; set; }
+    public string? Action { get; set; }
+    public string? InputType { get; set; }
     public int Page { get; set; } = 1;
     public int PageSize { get; set; } = 25;
 }
@@ -86,12 +90,18 @@ public interface IAIActivityRepository
 
     Task<(List<AIActivity> Items, long Total)> SearchAsync(ActivityFilter filter, CancellationToken ct);
     Task<AIActivity?> GetAsync(string activityId, CancellationToken ct);
-    Task<List<AIActivity>> ListByConversationAsync(string conversationId, int limit, CancellationToken ct);
-    Task<(List<AIConversationActivity> Items, long Total)> SearchConversationsAsync(string? search, int page, int pageSize, CancellationToken ct);
+    /// <summary><paramref name="tenantRef"/> null = all tenants (AI-dashboard developer screens only).</summary>
+    Task<List<AIActivity>> ListByConversationAsync(string conversationId, int limit, CancellationToken ct, string? tenantRef = null);
+    Task<(List<AIConversationActivity> Items, long Total)> SearchConversationsAsync(string? search, int page, int pageSize, CancellationToken ct, string? tenantRef = null);
     Task<AIConversationActivity?> GetConversationAsync(string conversationId, CancellationToken ct);
-    Task<List<string>> DistinctAsync(string field, CancellationToken ct);
+    Task<List<string>> DistinctAsync(string field, CancellationToken ct, string? tenantRef = null);
     /// <summary>Lightweight rows for the performance overview.</summary>
-    Task<List<AIActivity>> RecentForStatsAsync(DateTime from, int limit, CancellationToken ct);
+    Task<List<AIActivity>> RecentForStatsAsync(DateTime from, int limit, CancellationToken ct, string? tenantRef = null);
+
+    /// <summary>
+    /// AI dashboard analytics of one tenant: records without the large payloads (query, rows, answer, timeline).
+    /// </summary>
+    Task<List<AIActivity>> RecentForAnalysisAsync(string tenantRef, DateTime from, int limit, CancellationToken ct);
 
     /// <summary>Retention only (called by the background cleanup job, never by the agent).</summary>
     Task<long> PurgeOlderThanAsync(DateTime cutoff, CancellationToken ct);
@@ -121,6 +131,15 @@ public sealed class ActivityOptions
     public List<string> ExcludedResultFields { get; set; } = new();
     /// <summary>Max. activities waiting to be written; more are dropped (the chat never waits for the log).</summary>
     public int QueueCapacity { get; set; } = 2_000;
-    /// <summary>Allow MySaleBooks-token admins to open the activity viewer (default: agent dashboard accounts only).</summary>
+    /// <summary>
+    /// Allow MySaleBooks-token Admin/Tester users to use the developer screens (activity log, logs, providers…) and to
+    /// receive technical details (MQL, trace) in chat responses. Default false: customers never see technical details.
+    /// </summary>
     public bool AllowMySaleBooksAdmins { get; set; }
+    /// <summary>
+    /// Encrypt the stored MQL, raw model output, rejected query and stored result rows with ASP.NET Core Data Protection.
+    /// Enable only when Data Protection keys are persisted (DataProtection:KeysPath on durable storage) — otherwise
+    /// older records become unreadable after a restart.
+    /// </summary>
+    public bool EncryptPayloads { get; set; }
 }

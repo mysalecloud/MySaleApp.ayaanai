@@ -1,3 +1,4 @@
+using MySale.AI.Application.Abstractions;
 using MySale.AI.Application.Contracts;
 using MySale.AI.Application.Services;
 using MySale.AI.Domain;
@@ -75,12 +76,17 @@ public sealed class ActivityQueryService
 {
     private readonly IAIActivityRepository _repository;
     private readonly ActivityOptions _options;
+    private readonly ISecretProtector? _protector;
 
-    public ActivityQueryService(IAIActivityRepository repository, ActivityOptions options)
+    public ActivityQueryService(IAIActivityRepository repository, ActivityOptions options, ISecretProtector? protector = null)
     {
         _repository = repository;
         _options = options;
+        _protector = protector;
     }
+
+    /// <summary>Tenant reference for a customer database name (to filter the log by customer without storing the name).</summary>
+    public static string TenantRefFor(string databaseName) => ActivityHashing.TenantRef(databaseName.Trim(), null);
 
     public async Task<PagedResult<ActivitySummaryDto>> SearchAsync(ActivityFilter filter, CancellationToken ct)
     {
@@ -90,8 +96,13 @@ public sealed class ActivityQueryService
         return new PagedResult<ActivitySummaryDto>(items.Select(ToSummary).ToList(), total, filter.Page, filter.PageSize);
     }
 
+    /// <summary>Full record including the complete MQL (decrypted when Activity:EncryptPayloads was on).</summary>
     public async Task<AIActivity> GetAsync(string activityId, CancellationToken ct)
-        => await _repository.GetAsync(activityId, ct) ?? throw new NotFoundException("Activity not found.");
+    {
+        var activity = await _repository.GetAsync(activityId, ct) ?? throw new NotFoundException("Activity not found.");
+        if (activity.PayloadEncryption is not null && _protector is not null) ActivityRecorder.DecryptPayloads(activity, _protector);
+        return activity;
+    }
 
     public async Task<PagedResult<AIConversationActivity>> ConversationsAsync(string? search, int page, int pageSize, CancellationToken ct)
     {

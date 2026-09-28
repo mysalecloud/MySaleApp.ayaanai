@@ -58,6 +58,8 @@ public sealed class Conversation : Entity
 {
     public string UserId { get; set; } = string.Empty;
     public string CompanyId { get; set; } = string.Empty;
+    /// <summary>Display name of the owner (AI dashboard lists conversations of the whole tenant).</summary>
+    public string? UserName { get; set; }
     public string Title { get; set; } = "New conversation";
     public bool Archived { get; set; }
     public int MessageCount { get; set; }
@@ -181,6 +183,12 @@ public sealed class AuditLog : Entity
     public string? CompanyId { get; set; }
     public string? Details { get; set; }
     public string? IpAddress { get; set; }
+    /// <summary>AI dashboard access audit: section / resource type (e.g. "QueryLogs"), resource id, tenant ref, result.</summary>
+    public string? Resource { get; set; }
+    public string? ResourceId { get; set; }
+    public string? TenantRef { get; set; }
+    public string? Outcome { get; set; }
+    public string? CorrelationId { get; set; }
 }
 
 /// <summary>Business database connection (the database the AI queries).</summary>

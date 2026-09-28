@@ -6,7 +6,7 @@ namespace MySale.AI.Application.Mql;
 /// <summary>Structured query produced by the AI (untrusted until validated).</summary>
 public sealed class MqlQuery
 {
-    public string Type { get; set; } = "query";          // query | unsupported
+    public string Type { get; set; } = "query";          // query | unsupported | clarify
     public string Operation { get; set; } = "aggregate"; // find | aggregate | count | distinct
     public string Collection { get; set; } = string.Empty;
     public JsonArray? Pipeline { get; set; }
@@ -20,6 +20,8 @@ public sealed class MqlQuery
     public string? Reason { get; set; }
 
     public bool IsUnsupported => string.Equals(Type, "unsupported", StringComparison.OrdinalIgnoreCase);
+    /// <summary>The model could not map a business term and asks the user a short question (text in <see cref="Reason"/>).</summary>
+    public bool IsClarification => string.Equals(Type, "clarify", StringComparison.OrdinalIgnoreCase);
 
     public JsonObject ToJson()
     {
@@ -112,7 +114,7 @@ public static class MqlParser
             Collection = GetString(root, "collection") ?? string.Empty,
             Explanation = GetString(root, "explanation"),
             Visualization = GetString(root, "visualization")?.ToLowerInvariant(),
-            Reason = GetString(root, "reason"),
+            Reason = GetString(root, "reason") ?? GetString(root, "question"),
             Field = GetString(root, "field"),
             Pipeline = Get(root, "pipeline") as JsonArray,
             Filter = Get(root, "filter") as JsonObject ?? Get(root, "query") as JsonObject,
@@ -121,7 +123,7 @@ public static class MqlParser
             Limit = GetInt(root, "limit")
         };
 
-        if (q.IsUnsupported)
+        if (q.IsUnsupported || q.IsClarification)
             return new MqlParseResult { Success = true, Query = q, Json = root };
 
         q.Type = "query";

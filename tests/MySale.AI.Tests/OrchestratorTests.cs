@@ -132,7 +132,8 @@ public class OrchestratorTests
         var r = await h.Orchestrator.RunAsync(Ask("Sales on a holiday?"), NullChatEventSink.Instance, default);
 
         Assert.Equal(ChatStatus.NoResults, r.Status);
-        Assert.Equal(UserMessages.NoResults, r.Answer);
+        // A total over no documents is a real zero, not an empty answer.
+        Assert.Equal("Total sales are AED 0.00. No sales were recorded.", r.Answer);
         Assert.Single(h.Provider.Requests); // only the query step called the model
     }
 
@@ -278,8 +279,7 @@ public class OrchestratorTests
         h.Provider.Answer = req =>
         {
             var data = req.Messages[^1].Content;
-            Assert.Contains("Al Noor Trading", data);
-            Assert.DoesNotContain(id1, data); // the model never sees the raw ids
+            Assert.Contains("Al Noor Trading", data); // the model gets the name (the id is kept next to it)
             return "Al Noor Trading leads with AED 64,488.86.";
         };
 
@@ -288,8 +288,9 @@ public class OrchestratorTests
         Assert.Equal(ChatStatus.Success, r.Status);
         Assert.Equal("Al Noor Trading", r.Data![0]!["customerName"]!.GetValue<string>());
         Assert.Equal("Gulf Star Supplies", r.Data[1]!["customerName"]!.GetValue<string>());
-        Assert.DoesNotContain(id1, r.Data.ToJsonString());
-        Assert.Contains("customerName", r.Columns);
+        Assert.Equal(id1, r.Data[0]!["_id"]!.GetValue<string>());   // ids are preserved for relationships
+        Assert.Contains("customerName", r.Columns);                   // tables/charts show the name …
+        Assert.DoesNotContain("_id", r.Columns);                      // … instead of the id
         // The name lookup is tenant-scoped like every other query
         var lookup = Assert.Single(lookups);
         Assert.Contains(TestData.CompanyA, lookup);

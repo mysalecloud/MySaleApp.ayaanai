@@ -57,6 +57,10 @@ public sealed class SystemDbContext
             Builders<QueryLog>.IndexKeys.Ascending(l => l.CompanyId).Descending(l => l.CreatedAt)), cancellationToken: ct);
         await AuditLogs.Indexes.CreateOneAsync(new CreateIndexModel<AuditLog>(
             Builders<AuditLog>.IndexKeys.Descending(l => l.CreatedAt)), cancellationToken: ct);
+        await AuditLogs.Indexes.CreateOneAsync(new CreateIndexModel<AuditLog>(
+            Builders<AuditLog>.IndexKeys.Ascending(l => l.TenantRef).Descending(l => l.CreatedAt)), cancellationToken: ct);
+        await Conversations.Indexes.CreateOneAsync(new CreateIndexModel<Conversation>(
+            Builders<Conversation>.IndexKeys.Ascending(c => c.CompanyId).Descending(c => c.UpdatedAt)), cancellationToken: ct);
         await Attachments.Indexes.CreateOneAsync(new CreateIndexModel<Attachment>(
             Builders<Attachment>.IndexKeys.Ascending(a => a.UserId).Ascending(a => a.CompanyId).Descending(a => a.CreatedAt)), cancellationToken: ct);
         await Attachments.Indexes.CreateOneAsync(new CreateIndexModel<Attachment>(

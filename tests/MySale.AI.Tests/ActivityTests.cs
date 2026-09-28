@@ -87,7 +87,8 @@ public class ActivityTests
         Assert.Contains(a.Timeline, t => t.Stage == ActivityStages.MongoExecution);
         Assert.Contains(a.Timeline, t => t.Stage == ActivityStages.ResponseGeneration);
         Assert.Equal(ActivityStages.Completed, a.Timeline[^1].Stage);
-        Assert.True(a.Performance.TotalDurationMs >= a.Performance.MongoExecutionDurationMs);
+        Assert.Equal(7, a.Performance.MongoExecutionDurationMs); // FakeExecutor reports 7 ms
+        Assert.True(a.Performance.OtherDurationMs >= 0);
 
         // Conversation summary
         var c = Assert.Single(sink.Conversations);

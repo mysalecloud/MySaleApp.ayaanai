@@ -47,6 +47,8 @@ public sealed class FakeUser : IUserContext
     public string CompanyName { get; set; } = "Al Noor Trading LLC";
     public string Currency { get; set; } = "AED";
     public string TimeZone { get; set; } = "Asia/Dubai";
+    /// <summary>True = the caller used a customer MySaleBooks token (no technical details in responses).</summary>
+    public bool IsMySaleBooksUser { get; set; }
 }
 
 /// <summary>Scripted AI provider: returns queued responses in order, or throws.</summary>
@@ -124,8 +126,11 @@ public sealed class FakeExecutor : IQueryExecutor
 
 public sealed class FakeSchema : ISchemaService
 {
+    /// <summary>Extra collections added to the sample catalog (e.g. a Ledger collection with account groups).</summary>
+    public List<CollectionSchema> Extra { get; } = new();
+
     public Task<IReadOnlyList<CollectionSchema>> GetSchemaAsync(bool includeDiscovery, CancellationToken ct)
-        => Task.FromResult<IReadOnlyList<CollectionSchema>>(SampleSchemaCatalog.Build());
+        => Task.FromResult<IReadOnlyList<CollectionSchema>>(SampleSchemaCatalog.Build().Concat(Extra).ToList());
     public Task<List<JsonObject>> SampleAsync(string collection, int count, CancellationToken ct) => Task.FromResult(new List<JsonObject>());
     public Task<List<TenantValueInfo>> TenantValuesAsync(string collection, string field, CancellationToken ct) => Task.FromResult(new List<TenantValueInfo>());
     public void Invalidate() { }
@@ -171,6 +176,16 @@ public sealed class MemConversations : IConversationRepository
         => Task.FromResult(_s.Conversations.Where(c => c.UserId == userId && c.CompanyId == companyId).ToList());
     public Task<Conversation?> GetAsync(string id, string userId, string companyId, CancellationToken ct)
         => Task.FromResult(_s.Conversations.FirstOrDefault(c => c.Id == id && c.UserId == userId && c.CompanyId == companyId));
+    public Task<(List<Conversation> Items, long Total)> SearchByCompanyAsync(string companyId, string? search, DateTime? from, DateTime? to,
+        int page, int pageSize, CancellationToken ct)
+    {
+        var all = _s.Conversations.Where(c => !string.IsNullOrEmpty(companyId) && c.CompanyId == companyId).ToList();
+        return Task.FromResult((all.Skip((page - 1) * pageSize).Take(pageSize).ToList(), (long)all.Count));
+    }
+    public Task<Conversation?> GetForCompanyAsync(string id, string companyId, CancellationToken ct)
+        => Task.FromResult(_s.Conversations.FirstOrDefault(c => c.Id == id && !string.IsNullOrEmpty(companyId) && c.CompanyId == companyId));
+    public Task<long> CountByCompanyAsync(string companyId, DateTime from, CancellationToken ct)
+        => Task.FromResult((long)_s.Conversations.Count(c => c.CompanyId == companyId && c.UpdatedAt >= from));
     public Task InsertAsync(Conversation c, CancellationToken ct) { c.Id = MemoryStore.NewId(); _s.Conversations.Add(c); return Task.CompletedTask; }
     public Task UpdateAsync(Conversation c, CancellationToken ct) => Task.CompletedTask;
     public Task DeleteAsync(string id, CancellationToken ct) { _s.Conversations.RemoveAll(c => c.Id == id); return Task.CompletedTask; }
@@ -199,9 +214,17 @@ public sealed class MemLogs : IQueryLogRepository
     public Task InsertAsync(QueryLog log, CancellationToken ct) { log.Id = MemoryStore.NewId(); _s.Logs.Add(log); return Task.CompletedTask; }
     public Task UpdateAsync(QueryLog log, CancellationToken ct) => Task.CompletedTask;
     public Task<QueryLog?> GetAsync(string id, CancellationToken ct) => Task.FromResult(_s.Logs.FirstOrDefault(l => l.Id == id));
-    public Task<(List<QueryLog> Items, long Total)> SearchAsync(QueryLogFilter filter, CancellationToken ct) => Task.FromResult((_s.Logs.ToList(), (long)_s.Logs.Count));
+    public Task<(List<QueryLog> Items, long Total)> SearchAsync(QueryLogFilter filter, CancellationToken ct)
+    {
+        var all = _s.Logs.Where(l => filter.CompanyId is null || l.CompanyId == filter.CompanyId).ToList();
+        return Task.FromResult((all, (long)all.Count));
+    }
     public Task<List<QueryLog>> RecentAsync(string? companyId, int count, CancellationToken ct) => Task.FromResult(_s.Logs.TakeLast(count).ToList());
-    public Task<List<UsageRow>> GetUsageRowsAsync(DateTime from, DateTime to, string? companyId, CancellationToken ct) => Task.FromResult(new List<UsageRow>());
+    public Task<List<UsageRow>> GetUsageRowsAsync(DateTime from, DateTime to, string? companyId, CancellationToken ct)
+        => Task.FromResult(_s.Logs.Where(l => (companyId is null || l.CompanyId == companyId) && l.CreatedAt >= from && l.CreatedAt <= to)
+            .Select(l => new UsageRow { CreatedAt = l.CreatedAt, Status = l.Status, Model = l.Model, ProviderName = l.ProviderName,
+                InputTokens = l.InputTokens, OutputTokens = l.OutputTokens, Executed = l.Executed, TotalTimeMs = l.TotalTimeMs,
+                QueryGenerated = l.QueryGenerated, ValidationPassed = l.ValidationPassed, Blocked = l.Blocked }).ToList());
     public Task<List<string>> DistinctModelsAsync(CancellationToken ct) => Task.FromResult(_s.Logs.Select(l => l.Model ?? "").Distinct().ToList());
 }
 
@@ -218,6 +241,14 @@ public sealed class MemAudit : IAuditLogRepository
     private readonly MemoryStore _s;
     public MemAudit(MemoryStore s) => _s = s;
     public Task InsertAsync(AuditLog log, CancellationToken ct) { _s.Audit.Add(log); return Task.CompletedTask; }
+    public Task<(List<AuditLog> Items, long Total)> SearchForTenantAsync(AuditLogFilter f, CancellationToken ct)
+    {
+        var all = _s.Audit.Where(l => (!string.IsNullOrEmpty(f.CompanyId) && l.CompanyId == f.CompanyId)
+                                      || (!string.IsNullOrEmpty(f.TenantRef) && l.TenantRef == f.TenantRef))
+            .Where(l => string.IsNullOrEmpty(f.Action) || (f.Action.EndsWith('*') ? l.Action.StartsWith(f.Action.TrimEnd('*')) : l.Action == f.Action))
+            .OrderByDescending(l => l.CreatedAt).ToList();
+        return Task.FromResult((all.Skip((f.Page - 1) * f.PageSize).Take(f.PageSize).ToList(), (long)all.Count));
+    }
 }
 
 /// <summary>Builds a fully wired orchestrator over in-memory fakes.</summary>
@@ -229,8 +260,10 @@ public sealed class Harness
     public FakeUser User { get; } = new();
     public AIAgentOrchestrator Orchestrator { get; }
     public FakeRequestContext Request { get; } = new();
+    public FakeSchema Schema { get; } = new();
 
-    public Harness(IAIActivitySink? activitySink = null, ActivityOptions? activityOptions = null)
+    public Harness(IAIActivitySink? activitySink = null, ActivityOptions? activityOptions = null, ISecretProtector? activityProtector = null,
+        MySale.AI.Application.Stores.IStoreSelection? storeSelection = null, MySale.AI.Application.Stores.IStoreAccessProvider? storeAccess = null)
     {
         Store.Providers.Add(new ProviderConfig
         {
@@ -242,13 +275,17 @@ public sealed class Harness
         var settings = new SettingsService(new MemSettings(Store), audit);
         var providers = new ProviderService(new MemProviders(Store), new FakeProviderFactory(Provider), new PlainSecrets(), audit);
         var tenant = new TenantOptions();
-        var engine = new QueryEngine(new FakeSchema(), new MqlValidator(), new TenantQueryGuard(tenant), tenant, Executor, User);
+        var engine = new QueryEngine(Schema, new MqlValidator(), new TenantQueryGuard(tenant), tenant, Executor, User);
 
         Orchestrator = new AIAgentOrchestrator(
             new MemConversations(Store), new MemMessages(Store), new MemLogs(Store), providers, settings, engine,
             new PromptBuilder(), audit, User, TimeProvider.System, NullLogger<AIAgentOrchestrator>.Instance,
             activity: activitySink is null ? null
-                : new ActivityTracker(activitySink, activityOptions ?? new ActivityOptions(), Request, User, TimeProvider.System));
+                : new ActivityTracker(activitySink, activityOptions ?? new ActivityOptions(), Request, User, TimeProvider.System,
+                    protector: activityProtector),
+            stores: storeSelection is null ? null
+                : new MySale.AI.Application.Stores.StoreContextResolver(User, storeSelection,
+                    storeAccess ?? new MySale.AI.Application.Stores.UnknownStoreAccessProvider(), new MySale.AI.Application.Stores.StoreFilterOptions(), engine));
     }
 }
 
