@@ -22,6 +22,22 @@ public sealed class BusinessCalendarOptions
     /// Period questions must use this field, not createdAt / updatedAt.
     /// </summary>
     public Dictionary<string, string> BusinessDateFields { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// How business dates are stored: "Instant" (a real point in time; days follow the business time zone) or
+    /// "WallClockUtc" (the local date/time written as UTC — a business day is [date 00:00Z, next date 00:00Z)).
+    /// </summary>
+    public string DateStorage { get; set; } = "Instant";
+
+    /// <summary>
+    /// Date storage of MySaleBooks databases (MySaleBooks users). The MySaleBooks web and mobile apps send the local
+    /// date and time as UTC (Date.UTC(y, m, d, local hours…) / DateTime.Now without offset on a UTC server), so the
+    /// default is "WallClockUtc".
+    /// </summary>
+    public string MySaleBooksDateStorage { get; set; } = "WallClockUtc";
+
+    public bool IsWallClock(bool mySaleBooksUser)
+        => string.Equals(mySaleBooksUser ? MySaleBooksDateStorage : DateStorage, "WallClockUtc", StringComparison.OrdinalIgnoreCase);
 }
 
 public sealed record DateMention(string Text, DateOnly Date, int Index, int Length, bool ExplicitYear);

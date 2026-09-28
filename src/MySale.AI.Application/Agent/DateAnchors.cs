@@ -17,6 +17,13 @@ public sealed class DateAnchors
     public DateTime NowUtc { get; init; }
     public DateTime LocalNow { get; init; }
     public string TimeZoneId { get; init; } = "UTC";
+    /// <summary>
+    /// Time zone of the stored day boundaries. Equal to <see cref="TimeZoneId"/> when dates are stored as real instants;
+    /// "UTC" when the application stores the local wall-clock time as UTC (MySaleBooks: 10 Sep 21:00 local → 2026-09-10T21:00Z),
+    /// so a business day is [date 00:00Z, next date 00:00Z) while "today" still follows the business time zone.
+    /// </summary>
+    public string BoundaryTimeZoneId { get; init; } = "UTC";
+    public bool WallClockStorage { get; init; }
     public DateRange Today { get; init; }
     public DateRange Yesterday { get; init; }
     public DateRange Tomorrow { get; init; }
@@ -71,7 +78,7 @@ public sealed class DateAnchors
         return TimeZoneInfo.Utc;
     }
 
-    public static DateAnchors Compute(DateTime utcNow, string? timeZoneId, int financialYearStartMonth = 1)
+    public static DateAnchors Compute(DateTime utcNow, string? timeZoneId, int financialYearStartMonth = 1, bool wallClockStorage = false)
     {
         financialYearStartMonth = Math.Clamp(financialYearStartMonth, 1, 12);
         var tz = ResolveTimeZone(timeZoneId);
@@ -79,7 +86,8 @@ public sealed class DateAnchors
         var local = TimeZoneInfo.ConvertTimeFromUtc(utcNow, tz);
         var today = local.Date;
 
-        DateTime ToUtc(DateTime localDate) => LocalToUtc(localDate, tz);
+        var boundaryTz = wallClockStorage ? TimeZoneInfo.Utc : tz;
+        DateTime ToUtc(DateTime localDate) => LocalToUtc(localDate, boundaryTz);
 
         DateRange Range(DateTime startLocal, DateTime endLocal) => new(ToUtc(startLocal), ToUtc(endLocal));
 
@@ -94,6 +102,8 @@ public sealed class DateAnchors
             NowUtc = utcNow,
             LocalNow = local,
             TimeZoneId = tz.Id,
+            BoundaryTimeZoneId = boundaryTz.Id,
+            WallClockStorage = wallClockStorage,
             Today = Range(today, today.AddDays(1)),
             Yesterday = Range(today.AddDays(-1), today),
             Tomorrow = Range(today.AddDays(1), today.AddDays(2)),

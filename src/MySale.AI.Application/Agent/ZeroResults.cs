@@ -78,7 +78,7 @@ public static class ZeroResultPolicy
         (new(@"\b(last|past|previous)\s+(\d+)\s+days\b", RegexOptions.IgnoreCase), " in the last {n} days", "Last {n} days'"),
     };
 
-    public static ZeroResult Describe(string question, JsonArray? pipeline, string? collection, QuestionDates? dates, string currency)
+    public static ZeroResult Describe(string question, JsonArray? pipeline, string? collection, QuestionDates? dates, string? currency, int decimals = 2)
     {
         var zeroRow = pipeline is null ? null : ZeroRowFor(pipeline);
         var (period, possessive) = PeriodOf(question, dates);
@@ -104,7 +104,7 @@ public static class ZeroResultPolicy
             if (hasMoney && noun is "sales" or "purchases" or "payments" or "expenses" or "returns")
             {
                 var subject = possessive is not null ? $"{possessive} {noun}" : $"Total {noun}{period}";
-                return new ZeroResult { ZeroRow = zeroRow, Message = $"{subject} {(noun.EndsWith('s') ? "are" : "is")} {currency} 0.00. {listSentence}" };
+                return new ZeroResult { ZeroRow = zeroRow, Message = $"{subject} {(noun.EndsWith('s') ? "are" : "is")} {Money(currency, decimals)}. {listSentence}" };
             }
             return new ZeroResult { ZeroRow = zeroRow, Message = listSentence };
         }
@@ -114,6 +114,13 @@ public static class ZeroResultPolicy
             ZeroRow = zeroRow,
             Message = topic is not null ? Fill(topic.ListMessage, period) : $"No records matched your criteria{period}."
         };
+    }
+
+    /// <summary>"AED 0.00", "OMR 0.000"; without a verified currency just "0.00" (never a guessed currency).</summary>
+    private static string Money(string? currency, int decimals)
+    {
+        var zero = 0m.ToString("N" + Math.Clamp(decimals, 0, 6), System.Globalization.CultureInfo.InvariantCulture);
+        return string.IsNullOrWhiteSpace(currency) ? zero : currency.Trim() + " " + zero;
     }
 
     private static string Fill(string template, string period) => template.Replace("{period}", period);

@@ -6,7 +6,7 @@ namespace MySale.AI.Application.Mql;
 /// <summary>Structured query produced by the AI (untrusted until validated).</summary>
 public sealed class MqlQuery
 {
-    public string Type { get; set; } = "query";          // query | unsupported | clarify
+    public string Type { get; set; } = "query";          // query | unsupported | clarify | report
     public string Operation { get; set; } = "aggregate"; // find | aggregate | count | distinct
     public string Collection { get; set; } = string.Empty;
     public JsonArray? Pipeline { get; set; }
@@ -18,10 +18,16 @@ public sealed class MqlQuery
     public string? Explanation { get; set; }
     public string? Visualization { get; set; }
     public string? Reason { get; set; }
+    /// <summary>Arguments of a server report plan ({"type":"report","report":"ledgerStatement",…}).</summary>
+    public JsonObject? Arguments { get; set; }
 
     public bool IsUnsupported => string.Equals(Type, "unsupported", StringComparison.OrdinalIgnoreCase);
     /// <summary>The model could not map a business term and asks the user a short question (text in <see cref="Reason"/>).</summary>
     public bool IsClarification => string.Equals(Type, "clarify", StringComparison.OrdinalIgnoreCase);
+    /// <summary>A deterministic server report (ledger statement, stock movement) instead of a query.</summary>
+    public bool IsReport => string.Equals(Type, "report", StringComparison.OrdinalIgnoreCase);
+    /// <summary>Not a database query to validate/execute (unsupported, clarification or server report).</summary>
+    public bool IsNonQuery => IsUnsupported || IsClarification || IsReport;
 
     public JsonObject ToJson()
     {
@@ -40,6 +46,7 @@ public sealed class MqlQuery
         if (Explanation is not null) o["explanation"] = Explanation;
         if (Visualization is not null) o["visualization"] = Visualization;
         if (Reason is not null) o["reason"] = Reason;
+        if (Arguments is not null) o["arguments"] = Arguments.DeepClone();
         return o;
     }
 }
@@ -123,6 +130,11 @@ public static class MqlParser
             Limit = GetInt(root, "limit")
         };
 
+        if (q.IsReport)
+        {
+            q.Arguments = (JsonObject)root.DeepClone();
+            return new MqlParseResult { Success = true, Query = q, Json = root };
+        }
         if (q.IsUnsupported || q.IsClarification)
             return new MqlParseResult { Success = true, Query = q, Json = root };
 

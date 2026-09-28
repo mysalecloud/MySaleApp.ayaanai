@@ -77,7 +77,7 @@ public sealed class QuerySandboxService
             return response;
         }
         response.Parsed = parsed.Query!.ToJson();
-        if (!parsed.Query.IsUnsupported && !parsed.Query.IsClarification)
+        if (!parsed.Query.IsNonQuery)
             response.Validation = ToDto(_engine.Prepare(parsed.Query, _engine.CreateContext(schema, settings, null,
                 new DateCoercionContext
                 {
@@ -132,7 +132,7 @@ public sealed class QuerySandboxService
     {
         var parsed = MqlParser.Parse(queryJson.ToJsonString());
         if (!parsed.Success) return (null, parsed.Error);
-        if (parsed.Query!.IsUnsupported || parsed.Query.IsClarification) return (null, "The query is marked as unsupported.");
+        if (parsed.Query!.IsNonQuery) return (null, "The query is marked as unsupported.");
 
         var settings = await _settings.GetAsync(ct);
         var schema = await _engine.GetAllowedSchemaAsync(settings, ct);

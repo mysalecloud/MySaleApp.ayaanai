@@ -112,6 +112,16 @@ public sealed class QueryEngine
                 validation.Errors.Add($"For periods use the business date field \"{businessDate}\" of {validation.Collection}, not the record timestamp \"{used}\".");
             if (!validation.IsValid) return new PreparedQuery { Query = query, Validation = validation };
         }
+
+        // MySaleBooks business rules that prevent double counting (pipe-conditional stock sums, one currency per total).
+        foreach (var error in MySaleBooksDomain.Check(validation.Collection, pipeline)) validation.Errors.Add(error);
+        if (!validation.IsValid) return new PreparedQuery { Query = query, Validation = validation };
+
+        // Status filter the MySaleBooks reports always apply (cancelled documents excluded), enforced by the server.
+        // (named statusFilter: an if-condition pattern variable is in scope for the whole method, and "required" is used below)
+        if (MySaleBooksDomain.RequiredFilter(rootSchema) is { } statusFilter)
+            pipeline.Insert(0, new JsonObject { ["$match"] = statusFilter });
+
         TenantBinding? Resolve(string collection)
         {
             if (!bySchema.TryGetValue(collection, out var c)) return _guard.Default;
@@ -157,6 +167,8 @@ public sealed class QueryEngine
                 return new PreparedQuery { Query = query, Validation = validation };
             }
         }
+
+        foreach (var stage in scoped) AddRequiredFiltersToLookups(stage, bySchema);
 
         return new PreparedQuery
         {
@@ -274,6 +286,27 @@ public sealed class QueryEngine
         if (o["$facet"] is JsonObject facet)
             foreach (var (_, branch) in facet)
                 if (branch is JsonArray stages) foreach (var s in stages) AddStoreToLookups(s, store, bySchema);
+    }
+
+    /// <summary>Adds the server status filter (e.g. isCanceled ≠ true) inside every $lookup into a MySaleBooks transaction collection.</summary>
+    private static void AddRequiredFiltersToLookups(JsonNode? stage, IReadOnlyDictionary<string, CollectionSchema> bySchema)
+    {
+        if (stage is not JsonObject o) return;
+        if (o["$lookup"] is JsonObject lookup && lookup["from"]?.ToString() is { } from
+            && bySchema.TryGetValue(from, out var target) && MySaleBooksDomain.RequiredFilter(target) is { } filter)
+        {
+            if (lookup["pipeline"] is not JsonArray sub)
+            {
+                sub = new JsonArray();
+                lookup["pipeline"] = sub;
+            }
+            sub.Insert(0, new JsonObject { ["$match"] = filter });
+        }
+        if (o["$lookup"] is JsonObject l2 && l2["pipeline"] is JsonArray nested)
+            foreach (var s in nested.ToList()) AddRequiredFiltersToLookups(s, bySchema);
+        if (o["$facet"] is JsonObject facet)
+            foreach (var (_, branch) in facet)
+                if (branch is JsonArray stages) foreach (var s in stages) AddRequiredFiltersToLookups(s, bySchema);
     }
 
     private static bool HasStoreFilter(JsonArray scoped, string field, StoreScope store)
@@ -452,6 +485,31 @@ public sealed class QueryEngine
         if (t.Length == 0 || t.Length > 120 || !t.Any(char.IsLetter)) return false;           // numbers, codes like "1001"
         if (IsIdText(t) || DateTime.TryParse(t, out _)) return false;
         return true;
+    }
+
+    // ------------------------------------------------------------------ server-side master reads
+
+    /// <summary>
+    /// Reads a few documents of a master collection with a server-built pipeline (company settings, currency, branch).
+    /// Read-only, tenant-scoped, at most <paramref name="max"/> documents, 3 s. Never used with AI-generated pipelines.
+    /// </summary>
+    public async Task<List<JsonObject>> ReadMasterAsync(string collection, JsonArray pipeline, IReadOnlyList<CollectionSchema> schema,
+        AppSettings settings, int max, CancellationToken ct, string? comment = null)
+    {
+        var bySchema = schema.GroupBy(c => c.Name, StringComparer.OrdinalIgnoreCase).ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+        TenantBinding? Resolve(string c)
+        {
+            if (!bySchema.TryGetValue(c, out var cs)) return _guard.Default;
+            if (string.IsNullOrEmpty(cs.TenantField)) return null;
+            var isObjectId = cs.TenantValueType switch { "objectId" => true, "string" => false, _ => _tenant.ValueIsObjectId };
+            return new TenantBinding(cs.TenantField, isObjectId);
+        }
+        var scoped = _user.TenantIsDatabase
+            ? _guard.Apply(pipeline, _user.CompanyId, max, collection, _ => null)
+            : _guard.Apply(pipeline, _user.CompanyId, max, collection, Resolve);
+        var found = await _executor.ExecuteAsync(collection, scoped,
+            new QueryExecutionOptions { MaxDocuments = max, TimeoutMs = Math.Min(settings.Query.QueryTimeoutMs, 3000), Comment = comment }, ct);
+        return found.Rows;
     }
 
     // ------------------------------------------------------------------ stored business values (semantic step)

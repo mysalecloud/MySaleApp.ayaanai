@@ -285,7 +285,9 @@ public sealed class Harness
                     protector: activityProtector),
             stores: storeSelection is null ? null
                 : new MySale.AI.Application.Stores.StoreContextResolver(User, storeSelection,
-                    storeAccess ?? new MySale.AI.Application.Stores.UnknownStoreAccessProvider(), new MySale.AI.Application.Stores.StoreFilterOptions(), engine));
+                    storeAccess ?? new MySale.AI.Application.Stores.UnknownStoreAccessProvider(), new MySale.AI.Application.Stores.StoreFilterOptions(), engine),
+            companies: new CompanyContextService(engine, User),
+            reports: new MySaleBooksReports(engine));
     }
 }
 

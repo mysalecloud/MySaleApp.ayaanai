@@ -84,9 +84,10 @@ public sealed class MqlValidator
 
         public void Validate(MqlQuery q)
         {
-            if (q.IsUnsupported || q.IsClarification)
+            if (q.IsNonQuery)
             {
-                Error(q.IsClarification ? "The model asked for a clarification instead of a query." : "The model marked the question as unsupported.");
+                Error(q.IsClarification ? "The model asked for a clarification instead of a query."
+                    : q.IsReport ? "A server report plan is not a query." : "The model marked the question as unsupported.");
                 return;
             }
 

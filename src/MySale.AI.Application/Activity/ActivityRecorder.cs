@@ -356,6 +356,31 @@ public sealed class ActivityRecorder
             $"{string.Join(", ", fields)}: {result.Rows.Count} document(s){(used ? string.Empty : " — kept the original empty result")}");
     });
 
+    /// <summary>Company context used for the answer (base currency, decimals, financial year, date storage) — no secrets.</summary>
+    public void CompanyContextResolved(string summary) => Safe(() => AddStage("CompanyContext", "ok", null, Text(summary, 600)));
+
+    /// <summary>A deterministic MySaleBooks report ran (ledger statement / stock movement): every executed query is kept.</summary>
+    public void ReportExecuted(MqlQuery plan, IReadOnlyList<string> queries, int rows, bool truncated, long durationMs) => Safe(() =>
+    {
+        var q = _a.Query ??= new ActivityQueryInfo();
+        q.Kind = "report";
+        q.QueryVersion = "mysalebooks-report-v1";
+        q.GeneratedQueryJson = plan.ToJson().ToCompact();
+        q.ExecutedMql = string.Join("\n\n", queries);               // complete, not shortened
+        _a.Ai.Intent = "report:" + (plan.Arguments?["report"]?.ToString() ?? "unknown");
+        _a.Ai.ToolSelected = "mysalebooks-report";
+        var e = _a.Execution ??= new ActivityExecutionInfo { TenantRef = _a.TenantRef, StartedAt = Now };
+        e.Status = "Success";
+        e.Collection = plan.Arguments?["report"]?.ToString();
+        e.Operation = "report";
+        e.DocumentsReturned = rows;
+        e.Truncated = truncated;
+        e.DurationMs += durationMs;
+        e.CompletedAt = Now;
+        _mongoMs += durationMs;
+        AddStage("Report", "ok", durationMs, $"{queries.Count} quer(ies), {rows} row(s){(truncated ? ", truncated" : string.Empty)}");
+    });
+
     /// <summary>Business terms of the question mapped to accounting concepts / collections / stored group values.</summary>
     public void TermsResolved(string summary, long? durationMs) => Safe(() =>
     {
@@ -654,7 +679,7 @@ public sealed class ActivityRecorder
         q.QueryHash = "sha256:" + ActivityHashing.Sha256(hashable.ToCompact());
         if (!string.IsNullOrWhiteSpace(query.Explanation)) _a.Ai.Explanation = Text(query.Explanation, 2000);
         if (!string.IsNullOrWhiteSpace(query.Visualization)) _a.Ai.VisualizationHint = query.Visualization;
-        if (!query.IsUnsupported && !query.IsClarification && q.Kind == "query") { _a.Ai.Intent = $"database:{query.Operation}"; _a.Ai.ToolSelected = "database-query"; }
+        if (!query.IsNonQuery && q.Kind == "query") { _a.Ai.Intent = $"database:{query.Operation}"; _a.Ai.ToolSelected = "database-query"; }
         else if (q.Kind == "combined") _a.Ai.Intent = "attachment:combined";
     }
 

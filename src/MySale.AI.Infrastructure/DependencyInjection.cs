@@ -41,6 +41,9 @@ public static class DependencyInjection
         services.AddScoped<UsageService>();
         services.AddScoped<AuthService>();
         services.AddScoped<QueryEngine>();
+        // MySaleBooks: company base currency / financial year, and deterministic reports (ledger statement, stock movement).
+        services.AddScoped<CompanyContextService>();
+        services.AddScoped<MySaleBooksReports>();
         services.AddScoped<QuerySandboxService>();
         services.AddScoped<SchemaMetadataService>();
         services.AddScoped<AttachmentService>();
@@ -103,6 +106,8 @@ public static class DependencyInjection
         options.StoreFields = Configured(nameof(StoreFilterOptions.StoreFields)) ?? defaults.StoreFields;
         options.ExemptCollections = Configured(nameof(StoreFilterOptions.ExemptCollections)) ?? defaults.ExemptCollections;
         options.AllStoresValues = Configured(nameof(StoreFilterOptions.AllStoresValues)) ?? defaults.AllStoresValues;
+        options.SharedCollections = Configured(nameof(StoreFilterOptions.SharedCollections)) ?? defaults.SharedCollections;
+        options.SharedStoreValues = Configured(nameof(StoreFilterOptions.SharedStoreValues)) ?? defaults.SharedStoreValues;
         options.CollectionFields = new Dictionary<string, string>(options.CollectionFields, StringComparer.OrdinalIgnoreCase);
         return options;
     }

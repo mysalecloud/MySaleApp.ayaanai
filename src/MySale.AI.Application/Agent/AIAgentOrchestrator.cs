@@ -36,6 +36,25 @@ public sealed class NullChatEventSink : IChatEventSink
 public static class UserMessages
 {
     public const string ProviderUnavailable = "AI service is currently unavailable.";
+
+    /// <summary>Trial Balance / P&amp;L / Balance Sheet: not recalculated by AYAAN, so figures never differ from MySaleBooks.</summary>
+    public const string FinancialStatement =
+        "I don't recalculate the Trial Balance, Profit & Loss or Balance Sheet — they depend on the MySaleBooks stock valuation and closing rules, " +
+        "so please open that report in MySaleBooks (Reports → Accounts) for the exact figures. I can show ledger and group balances, " +
+        "income and expense totals, cash and bank balances, receivables and payables for any period.";
+
+    /// <summary>Specific explanation for declined questions whose data or rule is missing (null = use the generic reply).</summary>
+    public static string? ExplainUnsupported(string? reason)
+    {
+        var r = (reason ?? string.Empty).ToLowerInvariant();
+        if (r.Contains("valuation") || r.Contains("cost of goods") || r.Contains("cogs") || r.Contains("profit"))
+            return "Stock value on past dates, cost of goods sold and profit follow the company's costing method (FIFO / average / last purchase) " +
+                   "in the MySaleBooks Stock Register and Profit & Loss reports. I don't recalculate them, so the figures never differ from MySaleBooks — " +
+                   "please open those reports. I can show current stock value, quantities on any date, and sales or purchase quantities and amounts.";
+        if (r.Contains("financial statement") || r.Contains("trial balance") || r.Contains("balance sheet"))
+            return FinancialStatement;
+        return null;
+    }
     /// <summary>Kept for logs/compatibility; users see one of <see cref="BlockedQueryMessages"/> instead.</summary>
     public const string InvalidQuery = "Unable to safely execute the generated query.";
 
@@ -121,6 +140,8 @@ public sealed class AIAgentOrchestrator
     private readonly StoreContextResolver? _stores;
     private readonly BusinessCalendarOptions _calendar;
     private readonly BusinessTermOptions _terms;
+    private readonly CompanyContextService? _companies;
+    private readonly MySaleBooksReports? _reports;
 
     public AIAgentOrchestrator(
         IConversationRepository conversations,
@@ -139,8 +160,12 @@ public sealed class AIAgentOrchestrator
         ActivityTracker? activity = null,
         StoreContextResolver? stores = null,
         BusinessCalendarOptions? calendar = null,
-        BusinessTermOptions? terms = null)
+        BusinessTermOptions? terms = null,
+        CompanyContextService? companies = null,
+        MySaleBooksReports? reports = null)
     {
+        _companies = companies;
+        _reports = reports;
         _calendar = calendar ?? new BusinessCalendarOptions();
         _terms = terms ?? new BusinessTermOptions();
         _activity = activity;
@@ -275,6 +300,9 @@ public sealed class AIAgentOrchestrator
         QuestionDates questionDates = new();
         PreparedQuery? lastPrepared = null;
         SemanticInterpretation semantics = new();
+        // Configured currency only for databases without MySaleBooks company settings; replaced by the verified company currency.
+        string? currencyCode = string.IsNullOrWhiteSpace(_user.Currency) ? null : _user.Currency;
+        var currencyDecimals = 2;
         var attachmentContext = new AttachmentContext(attachmentsCurrent, attachmentsEarlier);
         ModelCapabilities? capabilities = null;
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -308,7 +336,9 @@ public sealed class AIAgentOrchestrator
             if (schema.Count == 0)
                 throw new QueryExecutionException("No collections are available for querying. Check the Database and Settings pages.");
 
-            var anchors = DateAnchors.Compute(now, _user.TimeZone, _calendar.FinancialYearStartMonth);
+            // MySaleBooks stores the local business date/time as UTC ("wall clock"): days are [date 00:00Z, next 00:00Z).
+            var wallClock = _calendar.IsWallClock(_user.IsMySaleBooksUser);
+            var anchors = DateAnchors.Compute(now, _user.TimeZone, _calendar.FinancialYearStartMonth, wallClock);
 
             // 3. Dates typed in the question (01/09/2026, Sep 1 to Sep 15 …) are resolved here, in the business locale.
             questionDates = QuestionDates.Parse(question, anchors.LocalToday, _calendar.DateOrder);
@@ -353,8 +383,33 @@ public sealed class AIAgentOrchestrator
                 activity.TermsResolved(semantics.Describe(), groupLookups > 0 ? termsSw.ElapsedMilliseconds : null);
             }
 
-            promptContext = new PromptContext(_user.CompanyName, _user.Currency, _user.TimeZone, anchors, settings.Query.MaxRecords, _engine.TenantField)
+            // 3d. Company context (MySaleBooks): base currency (code, decimals) and financial year from the company's own
+            //     settings — never assumed. Missing data is stated, not replaced by a default.
+            var domainActive = MySaleBooksDomain.IsActive(schema);
+            CompanyContext? company = _companies is null ? null : await _companies.ResolveAsync(schema, storeScope, settings, token);
+            if (company is not null)
             {
+                currencyCode = company.CurrencyResolved ? company.CurrencyCode : null;
+                currencyDecimals = company.Decimals ?? 2;
+                if (company.FinancialYearFrom is { } fyFrom && fyFrom.Month != anchors.FinancialYearStartMonth)
+                    anchors = DateAnchors.Compute(now, _user.TimeZone, fyFrom.Month, wallClock);
+                var companySummary = company.Describe() + (wallClock ? " · dates stored as local wall-clock time" : string.Empty);
+                trace.Add("company", "Company context", companySummary, company.CurrencyResolved ? "ok" : "warning");
+                activity.CompanyContextResolved(companySummary);
+            }
+
+            // Trial Balance / Profit & Loss / Balance Sheet are not recalculated: the figures come from the MySaleBooks reports.
+            if (domainActive && !attachmentContext.Any && StoreQuestionPolicy.IsAccountingStatement(question))
+            {
+                trace.Add("financialStatement", "Financial statement", "Not recalculated by AYAAN (MySaleBooks report required).", "warning");
+                return await FinishAsync(ChatStatus.Unsupported, UserMessages.FinancialStatement, "Financial statement requested");
+            }
+
+            promptContext = new PromptContext(_user.CompanyName, currencyCode ?? string.Empty, _user.TimeZone, anchors, settings.Query.MaxRecords, _engine.TenantField)
+            {
+                CurrencyDecimals = currencyDecimals,
+                CurrencyMissing = company is { CurrencyResolved: false } ? company.Missing ?? "the company currency is not configured" : null,
+                DomainRules = domainActive ? MySaleBooksDomain.PromptRules(schema) : null,
                 Semantics = semantics,
                 StoreMode = storeScope?.Mode.ToString(),
                 StoreName = storeScope?.StoreName,
@@ -400,7 +455,7 @@ public sealed class AIAgentOrchestrator
             var validationContext = _engine.CreateContext(schema, settings, storeScope,
                 new DateCoercionContext
                 {
-                    TimeZone = DateAnchors.ResolveTimeZone(_user.TimeZone),
+                    TimeZone = DateAnchors.ResolveTimeZone(anchors.BoundaryTimeZoneId),
                     InclusiveEndDays = questionDates.InclusiveEndDays,
                     MentionedDays = questionDates.MentionedDays
                 },
@@ -473,7 +528,7 @@ public sealed class AIAgentOrchestrator
                 else
                 {
                     query = parsed.Query!;
-                    if (query.IsUnsupported || query.IsClarification) break;
+                    if (query.IsNonQuery) break;
 
                     await sink.OnStatusAsync("validating", "Validating the query…", token);
                     var validationSw = Stopwatch.StartNew();
@@ -545,6 +600,51 @@ public sealed class AIAgentOrchestrator
                 return await FinishAsync(ChatStatus.Unsupported, askBack, "Clarification needed");
             }
 
+            // Server reports (ledger statement / stock movement): deterministic, same validation and scoping as queries.
+            if (query is { IsReport: true })
+            {
+                if (_reports is null || !domainActive)
+                    return await FinishAsync(ChatStatus.Unsupported, UserMessages.Unsupported, "Report plan without MySaleBooks data");
+                stage = ActivityStages.MongoExecution;
+                await sink.OnStatusAsync("executing", "Preparing the report…", token);
+                var outcome = await _reports.RunAsync(query, validationContext, anchors, settings, currencyDecimals, token,
+                    _activity is null ? null : ActivityRecorder.MongoComment(_activity.CorrelationId));
+                assistant.QueryJson = query.ToJson().ToCompact();
+                assistant.Operation = log.Operation = "report";
+                assistant.Mql = log.FinalMql = string.Join("\n\n", outcome.Queries);
+                trace.Add("report", "MySaleBooks report", $"{query.Arguments?["report"]} → {outcome.Kind}\n{assistant.Mql}", outcome.Kind == "ok" ? "ok" : "warning", outcome.ElapsedMs);
+                if (outcome.StoreContextMissing)
+                    return await FinishAsync(ChatStatus.Unsupported, StoreScope.MissingMessage, "Store context missing (report)");
+                switch (outcome.Kind)
+                {
+                    case "clarify":
+                        activity.Clarification(outcome.Message ?? string.Empty);
+                        return await FinishAsync(ChatStatus.Unsupported, outcome.Message ?? UserMessages.Unsupported, "Report needs a clarification");
+                    case "notfound":
+                        return await FinishAsync(ChatStatus.NoResults, outcome.Message ?? "No matching records were found.", null);
+                    case "ok":
+                        break;
+                    default:
+                        _logger.LogWarning("MySaleBooks report failed: {Error}", outcome.Message);
+                        return await FinishAsync(ChatStatus.InvalidQuery, "I couldn't prepare that report. Please try asking in a different way.", outcome.Message);
+                }
+                assistant.QueryGenerated = assistant.QueryValidated = assistant.QueryExecuted = true;
+                log.QueryGenerated = log.ValidationPassed = log.Executed = log.ExecutionSucceeded = true;
+                assistant.Collection = log.Collection = query.Arguments?["report"]?.ToString();
+                assistant.Explanation = outcome.Explanation;
+                activity.ReportExecuted(query, outcome.Queries, outcome.Rows.Count, outcome.Truncated, outcome.ElapsedMs);
+                await sink.OnQueryAsync(QueryInfoFor(assistant), token);
+                lastPrepared = null;
+                return await AnswerFromRowsAsync(outcome.Rows, outcome.Columns, outcome.Truncated, outcome.Explanation, "table", outcome.ElapsedMs);
+            }
+
+            if (query is { IsUnsupported: true } && domainActive && UserMessages.ExplainUnsupported(query.Reason) is { } explained)
+            {
+                activity.Unsupported(query);
+                trace.Add("unsupported", "Model declined", query.Reason ?? "No reason given.", "warning");
+                return await FinishAsync(ChatStatus.Unsupported, explained, null);
+            }
+
             if (query is { IsUnsupported: true })
             {
                 activity.Unsupported(query);
@@ -586,7 +686,9 @@ public sealed class AIAgentOrchestrator
                 repairAttempts = attempt,
                 maxRepairAttempts = settings.Ai.MaxRepairAttempts,
                 timeZone = _user.TimeZone,
-                currency = _user.Currency,
+                currency = currencyCode,
+                currencyDecimals,
+                dateStorage = anchors.WallClockStorage ? "WallClockUtc" : "Instant",
                 dateAnchors = anchors,
                 storeMode = storeScope?.Mode.ToString() ?? "None",
                 storeReason = storeScope?.Reason,
@@ -669,7 +771,7 @@ public sealed class AIAgentOrchestrator
                     log.GeneratedMql += "\n\n--- zero-result re-check ---\n" + ai.Text;
                     activity.QueryGenerated(attempt + 1, ai.Text, recheckSw.ElapsedMilliseconds, ai.Model);
                     var reParsed = MqlParser.Parse(ai.Text);
-                    var reQuery = reParsed.Success && reParsed.Query is { IsUnsupported: false, IsClarification: false } rq ? rq : null;
+                    var reQuery = reParsed.Success && reParsed.Query is { IsNonQuery: false } rq ? rq : null;
                     var rePrepared = reQuery is null ? null : _engine.Prepare(reQuery, validationContext, settings);
                     if (rePrepared is { IsExecutable: true } && !string.Equals(rePrepared.Mql, prepared.Mql, StringComparison.Ordinal))
                     {
@@ -775,7 +877,7 @@ public sealed class AIAgentOrchestrator
             ZeroResult? zero = null;
             if (rows.Count == 0)
             {
-                zero = ZeroResultPolicy.Describe(question, lastPrepared?.Validation.Pipeline, lastPrepared?.Validation.Collection, questionDates, _user.Currency);
+                zero = ZeroResultPolicy.Describe(question, lastPrepared?.Validation.Pipeline, lastPrepared?.Validation.Collection, questionDates, currencyCode, currencyDecimals);
                 if (zero.ZeroRow is { } zeroRow)
                 {
                     rows = new List<JsonObject> { zeroRow };

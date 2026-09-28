@@ -88,7 +88,9 @@ public sealed class SchemaService : ISchemaService
     {
         var db = await _business.GetDatabaseAsync(ct);
         var names = await (await db.ListCollectionNamesAsync(cancellationToken: ct)).ToListAsync(ct);
-        var curated = SampleSchemaCatalog.Build().ToDictionary(c => c.Name, StringComparer.Ordinal);
+        // Curated metadata: the sample catalog plus the verified MySaleBooks catalog (used only for collections that exist).
+        var curated = SampleSchemaCatalog.Build().Concat(MySaleBooksCatalog.Build())
+            .GroupBy(c => c.Name, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal);
         var saved = await LoadMetadataAsync(ct);
         var result = new List<CollectionSchema>();
 

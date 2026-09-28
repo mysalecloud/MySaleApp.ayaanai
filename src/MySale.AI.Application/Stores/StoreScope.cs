@@ -25,8 +25,16 @@ public sealed class StoreFilterOptions
     /// <summary>Explicit per-collection store field (overrides <see cref="StoreFields"/>); value "" = never store-filtered.</summary>
     public Dictionary<string, string> CollectionFields { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>Collections never store-filtered (the store master itself, company/user/settings data).</summary>
-    public List<string> ExemptCollections { get; set; } = new() { "Branches", "Branch", "Companies", "Company", "Users", "User" };
+    /// <summary>Collections never store-filtered (the store master itself, company/user/settings data, global account groups).</summary>
+    public List<string> ExemptCollections { get; set; } = new() { "Branches", "Branch", "Companies", "Company", "Users", "User", "AccountGroup", "AccountType" };
+
+    /// <summary>
+    /// Master collections whose records can be shared by all stores: a record with the store field set to one of
+    /// <see cref="SharedStoreValues"/> (or missing) belongs to every store (MySaleBooks masters use branchId "0"; the
+    /// MySaleBooks reports load them with branchId ∈ {store, "0"}). Transactions are never in this list.
+    /// </summary>
+    public List<string> SharedCollections { get; set; } = new() { "Item", "Ledger", "StockLocation", "Unit", "Category", "Currency" };
+    public List<string> SharedStoreValues { get; set; } = new() { "0" };
 
     /// <summary>Store master used to verify the selected store and read its name. Empty = the collection named Branch/Branches.</summary>
     public string? StoreCollection { get; set; }
@@ -88,9 +96,19 @@ public sealed class StoreScope
         return null;
     }
 
-    /// <summary>{field: value} for the selected store, typed like the field ({$oid} for ObjectId fields).</summary>
+    /// <summary>
+    /// {field: value} for the selected store, typed like the field ({$oid} for ObjectId fields). Shared masters also keep
+    /// records that belong to every store ({field: {$in: [store, "0", null]}}).
+    /// </summary>
     public JsonObject Filter(string field, CollectionSchema? collection)
     {
+        if (collection is not null && _options.SharedCollections.Contains(collection.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            var values = new JsonArray(JsonValue.Create(StoreId ?? string.Empty));
+            foreach (var shared in _options.SharedStoreValues) values.Add(JsonValue.Create(shared));
+            values.Add(null);
+            return new JsonObject { [field] = new JsonObject { ["$in"] = values } };
+        }
         var id = StoreId ?? string.Empty;
         var type = collection?.Fields.FirstOrDefault(f => string.Equals(f.Name, field, StringComparison.OrdinalIgnoreCase))?.Type;
         var looksObjectId = Regex.IsMatch(id, "^[0-9a-fA-F]{24}$");
