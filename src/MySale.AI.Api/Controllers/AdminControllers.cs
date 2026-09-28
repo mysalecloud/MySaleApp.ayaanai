@@ -11,7 +11,7 @@ namespace MySale.AI.Api.Controllers;
 
 [ApiController]
 [Route("api/ai/providers")]
-[Authorize(Policy = Policies.Chat)]
+[Authorize(Policy = Policies.Dashboard)]
 public sealed class ProvidersController : ControllerBase
 {
     private readonly ProviderService _service;
@@ -80,7 +80,7 @@ public sealed class ProvidersController : ControllerBase
 
 [ApiController]
 [Route("api/database")]
-[Authorize(Policy = Policies.Chat)]
+[Authorize(Policy = Policies.Dashboard)]
 public sealed class DatabaseController : ControllerBase
 {
     private readonly IBusinessDatabaseManager _manager;
@@ -203,7 +203,7 @@ public sealed class QueryController : ControllerBase
 
 [ApiController]
 [Route("api")]
-[Authorize(Policy = Policies.Chat)]
+[Authorize(Policy = Policies.Dashboard)]
 public sealed class MonitoringController : ControllerBase
 {
     private readonly QueryLogService _logs;
@@ -242,7 +242,7 @@ public sealed class MonitoringController : ControllerBase
 
 [ApiController]
 [Route("api/settings")]
-[Authorize(Policy = Policies.Chat)]
+[Authorize(Policy = Policies.Dashboard)]
 public sealed class SettingsController : ControllerBase
 {
     private readonly SettingsService _settings;

@@ -39,6 +39,11 @@ public sealed class ActivityController : ControllerBase
     public async Task<ActionResult<ActivityStatsDto>> Stats([FromQuery] int days = 7, CancellationToken ct = default)
         => Ok(await _service.StatsAsync(days, ct));
 
+    /// <summary>Tenant reference of a customer database (logs store only this hash, never the database name).</summary>
+    [HttpGet("tenant-ref")]
+    public ActionResult<object> TenantRef([FromQuery] string database)
+        => string.IsNullOrWhiteSpace(database) ? BadRequest() : Ok(new { tenantRef = ActivityQueryService.TenantRefFor(database) });
+
     [HttpGet("conversations")]
     public async Task<ActionResult<PagedResult<AIConversationActivity>>> Conversations(
         [FromQuery] string? search, [FromQuery] int page = 1, [FromQuery] int pageSize = 25, CancellationToken ct = default)

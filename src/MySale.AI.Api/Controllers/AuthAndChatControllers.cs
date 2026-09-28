@@ -178,9 +178,16 @@ public sealed class ConversationsController : ControllerBase
     public async Task<ActionResult<ConversationSummaryDto>> Create([FromBody] CreateConversationRequest request, CancellationToken ct)
         => Ok(await _service.CreateAsync(request.Title, ct));
 
+    /// <summary>Conversation history. Customers get answers/data only — never MQL, collections or internal ids.</summary>
     [HttpGet("{id}")]
-    public async Task<ActionResult<ConversationDetailDto>> Get(string id, CancellationToken ct)
-        => Ok(await _service.GetAsync(id, ct));
+    public async Task<ActionResult<ConversationDetailDto>> Get(string id, [FromServices] IUserContext user,
+        [FromServices] MySale.AI.Application.ActivityTracking.ActivityOptions activity, CancellationToken ct)
+    {
+        var detail = await _service.GetAsync(id, ct);
+        if (!TechnicalDetailsPolicy.CanSeeTechnicalDetails(user, activity.AllowMySaleBooksAdmins))
+            foreach (var m in detail.Messages) TechnicalDetailsPolicy.ForCustomer(m);
+        return Ok(detail);
+    }
 
     [HttpPatch("{id}")]
     public async Task<ActionResult<ConversationSummaryDto>> Update(string id, [FromBody] UpdateConversationRequest request, CancellationToken ct)

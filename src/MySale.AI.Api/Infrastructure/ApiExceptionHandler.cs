@@ -23,12 +23,13 @@ public sealed class ApiExceptionHandler : IExceptionHandler
         var (status, title, detail) = exception switch
         {
             NotFoundException e => (StatusCodes.Status404NotFound, "Not found", e.Message),
+            MySale.AI.Application.AIDashboard.AIDashboardAccessException e => (e.StatusCode, e.StatusCode switch { 401 => "Unauthorized", 503 => "Service unavailable", _ => "Forbidden" }, e.Message),
             AppValidationException e => (StatusCodes.Status400BadRequest, "Invalid request", e.Message),
             TenantResolutionException => (StatusCodes.Status400BadRequest, "Customer database not resolved", TenantResolutionException.UserMessage),
             AttachmentException e => (StatusCodes.Status400BadRequest, "Attachment rejected", e.Message),
             SpeechException e => (StatusCodes.Status502BadGateway, "Speech-to-text failed", e.Message),
             AIProviderException e => (StatusCodes.Status502BadGateway, "AI provider unavailable",
-                context.User.IsInRole("Admin") ? e.Message : "AI service is currently unavailable."),
+                context.User.IsInRole("Admin") && context.User.FindFirst(TenantClaimTypes.AuthSource)?.Value != TenantClaimTypes.MySaleBooks ? e.Message : "AI service is currently unavailable."),
             QueryTimeoutException => (StatusCodes.Status504GatewayTimeout, "Query timeout", "The query took too long to run."),
             QueryExecutionException => (StatusCodes.Status502BadGateway, "Database error", "Unable to access your business data."),
             TimeoutException or MongoConnectionException => (StatusCodes.Status503ServiceUnavailable, "Database unavailable", "The database is not reachable. Please try again later."),

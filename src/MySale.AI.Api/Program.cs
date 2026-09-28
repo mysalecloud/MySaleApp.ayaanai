@@ -19,6 +19,8 @@ var config = builder.Configuration;
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddScoped<IUserContext, HttpUserContext>();
 builder.Services.AddScoped<IRequestContext, HttpRequestContext>(); // correlation id + client app/version/session
+builder.Services.AddScoped<MySale.AI.Application.AIDashboard.IAIDashboardCallerAccessor, HttpAIDashboardCallerAccessor>();
+builder.Services.AddScoped<MySale.AI.Application.Stores.IStoreSelection, HttpStoreSelection>(); // X-Store-Id (MySaleBooks Store Location)
 builder.Services.AddAgentInfrastructure(config);
 builder.Services.AddAgentApplication(config);
 
@@ -48,12 +50,16 @@ builder.Services
 
 builder.Services.AddAuthorization(o =>
 {
-    o.AddPolicy(Policies.Chat, p => p.RequireAuthenticatedUser());
-    o.AddPolicy(Policies.Admin, p => p.RequireAuthenticatedUser().RequireRole(nameof(UserRole.Admin)));
-    o.AddPolicy(Policies.Developer, p => p.RequireAuthenticatedUser().RequireRole(nameof(UserRole.Admin), nameof(UserRole.Tester)));
-    // Activity log viewer: developers/admins of the AI dashboard only. Customer (MySaleBooks) tokens are refused
-    // unless Activity:AllowMySaleBooksAdmins is true — normal customers can never read the audit trail.
+    // Customer (MySaleBooks) tokens may chat, but the developer/admin surface (providers, database, schema, settings,
+    // query logs, usage, Query Lab, activity log) is for AI-dashboard accounts only, unless Activity:AllowMySaleBooksAdmins.
     var allowMySaleBooksAdmins = MySale.AI.Infrastructure.DependencyInjection.BindActivityOptions(config).AllowMySaleBooksAdmins;
+    bool NotCustomerToken(AuthorizationHandlerContext ctx)
+        => allowMySaleBooksAdmins || ctx.User.FindFirst(TenantClaimTypes.AuthSource)?.Value != TenantClaimTypes.MySaleBooks;
+    o.AddPolicy(Policies.Chat, p => p.RequireAuthenticatedUser());
+    o.AddPolicy(Policies.Dashboard, p => p.RequireAuthenticatedUser().RequireAssertion(NotCustomerToken));
+    o.AddPolicy(Policies.Admin, p => p.RequireAuthenticatedUser().RequireRole(nameof(UserRole.Admin)).RequireAssertion(NotCustomerToken));
+    o.AddPolicy(Policies.Developer, p => p.RequireAuthenticatedUser().RequireRole(nameof(UserRole.Admin), nameof(UserRole.Tester))
+        .RequireAssertion(NotCustomerToken));
     o.AddPolicy(Policies.ActivityViewer, p => p.RequireAuthenticatedUser()
         .RequireRole(nameof(UserRole.Admin), nameof(UserRole.Tester))
         .RequireAssertion(ctx => allowMySaleBooksAdmins
@@ -65,6 +71,7 @@ builder.Services.AddAuthorization(o =>
 var chatPerMinute = config.GetValue("RateLimiting:ChatPerMinute", 30);
 var loginPerMinute = config.GetValue("RateLimiting:LoginPerMinute", 10);
 var uploadsPerMinute = config.GetValue("RateLimiting:UploadsPerMinute", 20);
+var dashboardPerMinute = config.GetValue("RateLimiting:DashboardPerMinute", 120);
 builder.Services.AddRateLimiter(o =>
 {
     o.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
@@ -77,6 +84,9 @@ builder.Services.AddRateLimiter(o =>
     o.AddPolicy("upload", ctx => RateLimitPartition.GetFixedWindowLimiter(
         ctx.User.Identity?.Name ?? ctx.Connection.RemoteIpAddress?.ToString() ?? "anonymous",
         _ => new FixedWindowRateLimiterOptions { PermitLimit = uploadsPerMinute, Window = TimeSpan.FromMinutes(1), QueueLimit = 0 }));
+    o.AddPolicy("dashboard", ctx => RateLimitPartition.GetFixedWindowLimiter(
+        ctx.User.FindFirst(AgentClaims.UserId)?.Value ?? ctx.Connection.RemoteIpAddress?.ToString() ?? "anonymous",
+        _ => new FixedWindowRateLimiterOptions { PermitLimit = dashboardPerMinute, Window = TimeSpan.FromMinutes(1), QueueLimit = 0 }));
     o.OnRejected = async (ctx, ct) =>
     {
         ctx.HttpContext.Response.ContentType = "application/problem+json";

@@ -3,6 +3,7 @@ using System.Text.Encodings.Web;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.Extensions.Options;
 using MySale.AI.Application.Abstractions;
+using MySale.AI.Application.AIDashboard;
 using MySale.AI.Domain;
 using MySale.AI.Infrastructure.Security;
 
@@ -18,6 +19,13 @@ public static class AgentClaims
     public const string CompanyName = "company_name";
     public const string Currency = "currency";
     public const string TimeZone = "time_zone";
+    // Copied from the validated MySaleBooks token for the AIDashboard permission check (never from the request).
+    public const string MySaleBooksUserId = "msb_user_id";
+    public const string MySaleBooksRoleId = "msb_role_id";
+    public const string MySaleBooksPermission = "msb_permission";
+    public const string AuthTime = "msb_auth_time";
+    /// <summary>Claim TYPES (not values) present in the MySaleBooks token — diagnostics only.</summary>
+    public const string SourceClaimTypes = "msb_claim_types";
 }
 
 public static class Policies
@@ -25,6 +33,8 @@ public static class Policies
     public const string Admin = "Admin";
     public const string Developer = "Developer"; // Admin or Tester
     public const string Chat = "Chat";
+    /// <summary>AI dashboard screens (providers, database, schema, settings, logs, usage). Not for customer tokens.</summary>
+    public const string Dashboard = "Dashboard";
     /// <summary>AI activity log viewer (Admin/Tester dashboard accounts).</summary>
     public const string ActivityViewer = "ActivityViewer";
 }
@@ -55,14 +65,17 @@ public sealed class BearerTokenHandler : AuthenticationHandler<AuthenticationSch
     private readonly HmacTokenService _tokens;
     private readonly ITenantDatabaseResolver _tenantResolver;
     private readonly MySaleBooksAuthOptions _mySaleBooks;
+    private readonly AIDashboardOptions _dashboard;
 
     public BearerTokenHandler(IOptionsMonitor<AuthenticationSchemeOptions> options, ILoggerFactory logger, UrlEncoder encoder,
-        HmacTokenService tokens, ITenantDatabaseResolver tenantResolver, IOptions<MySaleBooksAuthOptions> mySaleBooks)
+        HmacTokenService tokens, ITenantDatabaseResolver tenantResolver, IOptions<MySaleBooksAuthOptions> mySaleBooks,
+        AIDashboardOptions dashboard)
         : base(options, logger, encoder)
     {
         _tokens = tokens;
         _tenantResolver = tenantResolver;
         _mySaleBooks = mySaleBooks.Value;
+        _dashboard = dashboard;
     }
 
     protected override Task<AuthenticateResult> HandleAuthenticateAsync()
@@ -131,6 +144,15 @@ public sealed class BearerTokenHandler : AuthenticationHandler<AuthenticationSch
             new(TenantClaimTypes.AuthSource, TenantClaimTypes.MySaleBooks)
         };
         if (!string.IsNullOrEmpty(companyId)) claims.Add(new Claim(AgentClaims.CompanyId, companyId));
+
+        // AIDashboard: MySaleBooks user id / role id / permission claims / sign-in time, from the validated token only.
+        if (First(_dashboard.UserIdClaims.ToArray()) is { } msbUser) claims.Add(new Claim(AgentClaims.MySaleBooksUserId, msbUser));
+        if (First(_dashboard.UserRoleIdClaims.ToArray()) is { } msbRole) claims.Add(new Claim(AgentClaims.MySaleBooksRoleId, msbRole));
+        foreach (var type in _dashboard.PermissionClaims.Where(t => !string.IsNullOrEmpty(t)).Distinct())
+            foreach (var c in source.FindAll(type).Where(c => !string.IsNullOrWhiteSpace(c.Value)).Take(500))
+                claims.Add(new Claim(AgentClaims.MySaleBooksPermission, c.Value));
+        if (First(_dashboard.AuthTimeClaims.ToArray()) is { } authTime) claims.Add(new Claim(AgentClaims.AuthTime, authTime));
+        claims.Add(new Claim(AgentClaims.SourceClaimTypes, string.Join(",", source.Claims.Select(c => c.Type).Distinct().Take(60))));
         // Only the validated claim is carried forward; a missing dbName is handled by the chat endpoint (400).
         if (!string.IsNullOrEmpty(result.DatabaseName)) claims.Add(new Claim(TenantClaimTypes.DatabaseName, result.DatabaseName));
 
