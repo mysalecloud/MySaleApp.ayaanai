@@ -133,6 +133,10 @@ public sealed class ChatController : ControllerBase
             AddTenantDebug(result);
             await sink.WriteAsync("done", result, CancellationToken.None);
         }
+        catch (ChatConversationException ex)
+        {
+            await sink.WriteAsync("error", new { code = ex.Code, message = ex.Message }, CancellationToken.None);
+        }
         catch (NotFoundException ex)
         {
             await sink.WriteAsync("error", new { code = "NotFound", message = ex.Message }, CancellationToken.None);

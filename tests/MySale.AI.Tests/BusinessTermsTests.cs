@@ -315,7 +315,10 @@ public class BusinessTermOrchestratorTests
     {
         var h = new Harness();
         var r = await h.Orchestrator.RunAsync(new ChatRequest { Message = "Show party list" }, NullChatEventSink.Instance, default);
-        Assert.Equal(ChatStatus.Unsupported, r.Status);
+        Assert.Equal(ChatStatus.Clarification, r.Status);
+        Assert.True(r.Success);
+        Assert.Equal("clarification", r.ResponseType);
+        Assert.Equal(new[] { "customers", "suppliers" }, r.Clarification!.Options);
         Assert.Contains("customers", r.Answer);
         Assert.Empty(h.Provider.Requests);
         Assert.Null(h.Executor.LastCall);
@@ -327,7 +330,7 @@ public class BusinessTermOrchestratorTests
         var h = new Harness();
         h.Provider.QueryResponses.Enqueue(_ => """{"type":"clarify","question":"Do you mean the sales target or the purchase budget?"}""");
         var r = await h.Orchestrator.RunAsync(new ChatRequest { Message = "Show the plan figures" }, NullChatEventSink.Instance, default);
-        Assert.Equal(ChatStatus.Unsupported, r.Status);
+        Assert.Equal(ChatStatus.Clarification, r.Status);
         Assert.Equal("Do you mean the sales target or the purchase budget?", r.Answer);
         Assert.Null(h.Executor.LastCall);
     }
@@ -341,7 +344,7 @@ public class BusinessTermOrchestratorTests
         var h = new Harness();
         h.Provider.QueryResponses.Enqueue(_ => new JsonObject { ["type"] = "clarify", ["question"] = question }.ToJsonString());
         var r = await h.Orchestrator.RunAsync(new ChatRequest { Message = "Show the plan figures" }, NullChatEventSink.Instance, default);
-        Assert.Equal(ChatStatus.Unsupported, r.Status);
+        Assert.Equal(ChatStatus.Clarification, r.Status);
         Assert.DoesNotContain("groupName", r.Answer);
         Assert.DoesNotContain("$match", r.Answer);
         Assert.DoesNotContain("SaleItems", r.Answer);

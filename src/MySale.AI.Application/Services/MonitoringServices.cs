@@ -68,7 +68,7 @@ public sealed class QueryLogService
 
 public sealed class UsageService
 {
-    private static readonly HashSet<ChatStatus> Successful = new() { ChatStatus.Success, ChatStatus.NoResults, ChatStatus.Unsupported };
+    private static readonly HashSet<ChatStatus> Successful = new() { ChatStatus.Success, ChatStatus.NoResults, ChatStatus.Unsupported, ChatStatus.Clarification };
     private static readonly HashSet<ChatStatus> SystemErrors = new() { ChatStatus.ProviderError, ChatStatus.DatabaseError, ChatStatus.Timeout, ChatStatus.Error };
 
     private readonly IQueryLogRepository _logs;

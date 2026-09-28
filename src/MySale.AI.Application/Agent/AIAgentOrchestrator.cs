@@ -142,6 +142,7 @@ public sealed class AIAgentOrchestrator
     private readonly BusinessTermOptions _terms;
     private readonly CompanyContextService? _companies;
     private readonly MySaleBooksReports? _reports;
+    private readonly IConversationStateRepository _states;
 
     public AIAgentOrchestrator(
         IConversationRepository conversations,
@@ -162,8 +163,10 @@ public sealed class AIAgentOrchestrator
         BusinessCalendarOptions? calendar = null,
         BusinessTermOptions? terms = null,
         CompanyContextService? companies = null,
-        MySaleBooksReports? reports = null)
+        MySaleBooksReports? reports = null,
+        IConversationStateRepository? states = null)
     {
+        _states = states ?? new InMemoryConversationStateRepository();
         _companies = companies;
         _reports = reports;
         _calendar = calendar ?? new BusinessCalendarOptions();
@@ -190,18 +193,36 @@ public sealed class AIAgentOrchestrator
         // Activity tracking: every request leaves an audit record. Tracking never changes or breaks the answer.
         var activity = _activity?.Begin(request, sink.StreamTokens) ?? ActivityRecorder.Disabled;
         var started = Stopwatch.StartNew();
+        var turn = new TurnLease();
         try
         {
-            return await RunCoreAsync(request, sink, activity, ct);
+            return await RunCoreAsync(request, sink, activity, turn, ct);
         }
         catch (Exception ex)
         {
             activity.Fail(ex, started.ElapsedMilliseconds); // no-op when the turn already completed normally
             throw;
         }
+        finally
+        {
+            // A turn that ended without saving (duplicate reply, exception) must not keep the conversation locked.
+            if (turn.ConversationId is not null && !turn.Saved)
+            {
+                try { await _states.ReleaseAsync(turn.ConversationId, turn.TurnId, CancellationToken.None); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Could not release the conversation turn"); }
+            }
+        }
     }
 
-    private async Task<ChatResponse> RunCoreAsync(ChatRequest request, IChatEventSink sink, ActivityRecorder activity, CancellationToken ct)
+    /// <summary>The lease that serialises the turns of one conversation (duplicate / out-of-order protection).</summary>
+    private sealed class TurnLease
+    {
+        public string TurnId { get; } = Guid.NewGuid().ToString("N");
+        public string? ConversationId { get; set; }
+        public bool Saved { get; set; }
+    }
+
+    private async Task<ChatResponse> RunCoreAsync(ChatRequest request, IChatEventSink sink, ActivityRecorder activity, TurnLease turn, CancellationToken ct)
     {
         var total = Stopwatch.StartNew();
         // Technical details (MQL, pipeline, collections, trace) only for AI-dashboard developers/admins — never customers.
@@ -229,12 +250,191 @@ public sealed class AIAgentOrchestrator
         // 1. Conversation + context
         var conversation = await LoadOrCreateConversationAsync(request, question, persist, ct);
         activity.SetConversation(conversation, persist);
+
+        // 1a. One turn at a time per conversation, owned by this tenant + user + customer database (verified again on
+        //     every request). A second message while the first is still being answered is refused, so answers and
+        //     clarification state can never be applied out of order.
+        var now = _time.GetUtcNow().UtcDateTime;
+        var leaseFor = TimeSpan.FromSeconds(Math.Max(30, settings.Ai.TimeoutSeconds) + 60);
+        var (begin, loadedState) = await _states.TryBeginTurnAsync(conversation.Id, _user.CompanyId, _user.UserId, _user.DatabaseName,
+            turn.TurnId, now, leaseFor, ct);
+        if (begin == TurnStart.NotOwner) throw ChatConversationException.ConversationNotFound();
+        if (begin == TurnStart.Busy || loadedState is null) throw ChatConversationException.ConversationBusy();
+        turn.ConversationId = conversation.Id;
+        var state = loadedState;
+
+        // 1b. The same message sent twice (network retry, double click) is answered once.
+        if (!string.IsNullOrWhiteSpace(request.ClientMessageId)
+            && state.RecentTurns.FirstOrDefault(t => t.ClientMessageId == request.ClientMessageId) is { } previousTurn)
+        {
+            if (persist && previousTurn.UserMessageId is { } pu && previousTurn.AssistantMessageId is { } pa
+                && await _messages.GetAsync(pu, ct) is { } previousUser && await _messages.GetAsync(pa, ct) is { } previousAssistant
+                && previousUser.ConversationId == conversation.Id && previousAssistant.ConversationId == conversation.Id)
+            {
+                var again = MessageMapper.ToChatResponse(conversation, previousUser, previousAssistant, null);
+                return showTechnical ? again : TechnicalDetailsPolicy.ForCustomer(again);
+            }
+            throw ChatConversationException.DuplicateMessage();
+        }
+
+        string? regeneratedResolved = null;
         if (persist && !string.IsNullOrEmpty(request.RegenerateMessageId))
-            await RemoveForRegenerateAsync(conversation, request.RegenerateMessageId, ct);
+        {
+            var removed = await RemoveForRegenerateAsync(conversation, request.RegenerateMessageId, ct);
+            if (removed?.ResolvedQuestion is { Length: > 0 } resolvedBefore
+                && string.Equals(removed.Content.Trim(), question, StringComparison.OrdinalIgnoreCase))
+                regeneratedResolved = resolvedBefore;
+            if (state.Pending?.AssistantMessageId == request.RegenerateMessageId) state.Pending = null;
+        }
 
         var history = persist && settings.Chat.HistoryMessages > 0 && conversation.MessageCount > 0
             ? await _messages.ListRecentAsync(conversation.Id, settings.Chat.HistoryMessages, ct)
             : new List<ChatMessage>();
+        // Without saved history the last completed request still gives follow-ups ("the same for last month") their context.
+        if (history.Count == 0 && state.LastRequest is { QueryJson.Length: > 0 } lastRequest)
+            history = new List<ChatMessage>
+            {
+                new() { Role = MessageRole.User, Content = lastRequest.Question, Status = ChatStatus.Success, CreatedAt = lastRequest.At },
+                new() { Role = MessageRole.Assistant, QueryJson = lastRequest.QueryJson, Status = ChatStatus.Success, CreatedAt = lastRequest.At }
+            };
+
+        // 1c. Connect this message to the open clarification: an answer (or a corrected answer) is merged into the
+        //     original request; "cancel" drops it; a different question starts a new topic. Nothing is guessed: a short
+        //     reply without any context, or to a question that expired, gets a focused question back.
+        var rawQuestion = question;
+        var plannerQuestion = question;
+        PendingClarification? activePending = null;   // open question answered by this message
+        string activeOriginal = question;
+        var activeAnswers = new List<ClarificationAnswer>();
+        PendingClarification? newPending = null;      // question asked in this turn
+        MqlQuery? forcedPlan = null;                  // report re-run with the customer's choice (no model call)
+        (ChatStatus Status, string Text, string? Reason)? earlyReply = null;
+        string? contextNote = null;
+        var conversationNotes = new List<string>();
+        IReadOnlyList<CollectionSchema> knownSchema = Array.Empty<CollectionSchema>();
+        var earlyAnchors = DateAnchors.Compute(now, _user.TimeZone, _calendar.FinancialYearStartMonth, _calendar.IsWallClock(_user.IsMySaleBooksUser));
+
+        if (regeneratedResolved is not null)
+        {
+            question = plannerQuestion = regeneratedResolved;
+            conversationNotes.Add("Regenerated with the complete request of the original turn: " + ClarificationFlow.Short(regeneratedResolved, 300));
+        }
+        else if (state.Pending is { } pending)
+        {
+            var kind = ClarificationFlow.Classify(rawQuestion, pending);
+            if (kind == ReplyKind.Answer && request.ReplyToMessageId is { Length: > 0 } replyTo
+                && pending.AssistantMessageId is { Length: > 0 } askedIn && replyTo != askedIn)
+            {
+                // A reply to an older question (sent late or twice) is not merged into the question that is open now.
+                newPending = ClarificationFlow.Copy(pending);
+                newPending.AskedAt = now;
+                earlyReply = (ChatStatus.Clarification, "That earlier question has already been answered. " + pending.Question, "Reply to an older clarification");
+                conversationNotes.Add("Reply to an older clarification message — not merged; the open question was asked again.");
+            }
+            else if (ClarificationFlow.IsExpired(pending, now, settings.Chat.ClarificationMinutes))
+            {
+                state.Pending = null;
+                conversationNotes.Add($"Open question expired (asked {pending.AskedAt:u}); reply classified as {kind}.");
+                if (kind == ReplyKind.Answer)
+                    earlyReply = (ChatStatus.Clarification,
+                        $"It's been a while since I asked about “{ClarificationFlow.Short(pending.OriginalQuestion)}”, so I won't guess what “{ClarificationFlow.Short(rawQuestion, 40)}” refers to. " +
+                        "Please send the complete request in one message.",
+                        "Clarification expired");
+            }
+            else
+            {
+                switch (kind)
+                {
+                    case ReplyKind.Cancel:
+                        state.Pending = null;
+                        conversationNotes.Add("Open request cancelled by the customer: " + ClarificationFlow.Short(pending.OriginalQuestion, 200));
+                        earlyReply = (ChatStatus.Success, $"Okay, I've cancelled “{ClarificationFlow.Short(pending.OriginalQuestion)}”. What would you like to know?", null);
+                        break;
+                    case ReplyKind.NewTopic:
+                        state.Pending = null;
+                        conversationNotes.Add("New topic — the open request was dropped: " + ClarificationFlow.Short(pending.OriginalQuestion, 200));
+                        break;
+                    default:
+                        if (pending.Source is "ambiguousDate" or "invalidDate")
+                        {
+                            var chosen = ClarificationFlow.ResolveDate(rawQuestion, pending, earlyAnchors.LocalToday, _calendar.DateOrder);
+                            if (chosen is null)
+                            {
+                                newPending = ClarificationFlow.Copy(pending);
+                                newPending.AskedAt = now;
+                                earlyReply = (ChatStatus.Clarification,
+                                    pending.Options.Count > 0
+                                        ? $"Please choose one of these dates: {string.Join(" or ", pending.Options)}."
+                                        : "Please write the date like 1 September 2026.",
+                                    "Date clarification not settled");
+                                conversationNotes.Add("The reply did not settle the date — asked again.");
+                                break;
+                            }
+                            (activeOriginal, activeAnswers) = ClarificationFlow.ApplyDate(pending.OriginalQuestion, pending.Answers, pending.ReplaceText, chosen);
+                            conversationNotes.Add($"Date “{pending.ReplaceText}” → “{chosen}”.");
+                        }
+                        else
+                        {
+                            activeOriginal = pending.OriginalQuestion;
+                            activeAnswers = ClarificationFlow.Copy(pending).Answers;
+                            var resolved = ClarificationFlow.Resolve(rawQuestion, pending);
+                            activeAnswers.Add(new ClarificationAnswer { Question = pending.Question, Reply = rawQuestion, Resolved = resolved, At = now });
+                            conversationNotes.Add($"Answer to “{pending.Question}”: “{rawQuestion}”" + (resolved is null ? string.Empty : $" (= {resolved})") + $" · step {pending.Step}.");
+
+                            // A question asked by a server report (which item? which ledger?): the answer fills the report
+                            // argument and the report runs again with the verified record id — no model call, no re-guessing.
+                            if (pending.Plan is { Length: > 0 } planJson && pending.PlanArgument is { Length: > 0 } planArg
+                                && JsonNode.Parse(planJson) is JsonObject planArgs)
+                            {
+                                var chosen = resolved is null ? -1 : pending.Options.FindIndex(o => string.Equals(o, resolved, StringComparison.OrdinalIgnoreCase));
+                                if (chosen < 0 && pending.Options.Count > 0 && resolved == "no")
+                                {
+                                    newPending = ClarificationFlow.Copy(pending);
+                                    newPending.Options = new List<string>();
+                                    newPending.OptionIds = new List<string>();
+                                    newPending.Question = planArg == "ledger"
+                                        ? "Please type the exact ledger (account) name."
+                                        : "Please type the item's exact name, item code or barcode.";
+                                    newPending.AskedAt = now;
+                                    earlyReply = (ChatStatus.Clarification, newPending.Question, "Choice declined");
+                                    conversationNotes.Add("The offered choice was declined — asked for the exact name or code.");
+                                    break;
+                                }
+                                planArgs.Remove(planArg + "Id");
+                                if (chosen >= 0)
+                                {
+                                    planArgs[planArg] = pending.Options[chosen];
+                                    if (chosen < pending.OptionIds.Count && pending.OptionIds[chosen].Length > 0) planArgs[planArg + "Id"] = pending.OptionIds[chosen];
+                                }
+                                else
+                                {
+                                    planArgs[planArg] = ClarificationFlow.Short(rawQuestion, 60);    // a typed name, code or barcode
+                                }
+                                forcedPlan = new MqlQuery { Type = "report", Arguments = planArgs };
+                                conversationNotes.Add($"Report runs again with {planArg} “{planArgs[planArg]}”" + (planArgs.ContainsKey(planArg + "Id") ? " (verified id)." : "."));
+                            }
+                        }
+                        activePending = pending;
+                        var merged = ClarificationFlow.Merge(activeOriginal, activeAnswers);
+                        question = merged.Analysis;
+                        plannerQuestion = merged.Prompt;
+                        conversationNotes.Add("Complete request: " + ClarificationFlow.Short(question, 400));
+                        break;
+                }
+            }
+        }
+        else if (ClarificationFlow.IsCancel(rawQuestion) && (request.Attachments?.Count ?? 0) == 0)
+        {
+            earlyReply = (ChatStatus.Success, "There's no open request to cancel. What would you like to know?", null);
+        }
+        else if (history.Count == 0 && (request.Attachments?.Count ?? 0) == 0 && ClarificationFlow.IsBareReply(rawQuestion))
+        {
+            earlyReply = (ChatStatus.Clarification,
+                $"I'm not sure what “{ClarificationFlow.Short(rawQuestion, 40)}” refers to — there's no earlier question in this conversation for it to answer. " +
+                "What would you like to see? For example: “Show my stock value” or “Yesterday's sales”.",
+                "Short reply without conversation context");
+            conversationNotes.Add("Short reply without an open question or earlier turns — asked for the full request.");
+        }
 
         // Unified input: typed text, voice (already transcribed) and attachments all become one request.
         var attachmentsCurrent = new List<Attachment>();
@@ -245,16 +445,21 @@ public sealed class AIAgentOrchestrator
 
         var inputType = request.Voice is not null ? "voice" : attachmentsCurrent.Count > 0 ? "attachment" : "text";
         if (request.InputType is "text" or "voice" or "attachment") inputType = request.InputType;
-        activity.SetQuestion(question, inputType);
+        activity.SetQuestion(rawQuestion, inputType);
+        if (conversationNotes.Count > 0)
+        {
+            trace.Add("conversation", "Conversation context", string.Join("\n", conversationNotes), "ok");
+            activity.ConversationContext(string.Join(" | ", conversationNotes));
+        }
 
-        var now = _time.GetUtcNow().UtcDateTime;
         var userMessage = new ChatMessage
         {
             ConversationId = conversation.Id,
             UserId = _user.UserId,
             CompanyId = _user.CompanyId,
             Role = MessageRole.User,
-            Content = question,
+            Content = rawQuestion,
+            ResolvedQuestion = question != rawQuestion ? question : null,
             Status = ChatStatus.Success,
             CreatedAt = now,
             InputType = inputType,
@@ -286,7 +491,8 @@ public sealed class AIAgentOrchestrator
         };
         var log = new QueryLog
         {
-            Question = question,
+            Question = rawQuestion,
+            ResolvedQuestion = question != rawQuestion ? question : null,
             UserId = _user.UserId,
             UserName = _user.DisplayName,
             CompanyId = _user.CompanyId,
@@ -310,11 +516,22 @@ public sealed class AIAgentOrchestrator
         var token = timeout.Token;
 
         // "Show me the query you used" / system prompt / database names → fixed refusal (no AI call, nothing internal returned).
-        if (attachmentsCurrent.Count == 0 && TechnicalDetailsPolicy.IsTechnicalDetailsRequest(question))
+        if (attachmentsCurrent.Count == 0 && TechnicalDetailsPolicy.IsTechnicalDetailsRequest(rawQuestion))
         {
             activity.RefusedTechnicalDetails();
             trace.Add("policy", "Technical details request", "Refused: the question asks for internal queries or system details.", "warning");
             return await FinishAsync(ChatStatus.Unsupported, TechnicalDetailsPolicy.RefusalMessage, "Technical details request refused");
+        }
+
+        // Cancel / expired question / short reply without context / reply to an older question: answered without the model.
+        if (earlyReply is { } early)
+        {
+            if (early.Status == ChatStatus.Clarification)
+            {
+                assistant.ClarificationOptions = newPending?.Options.ToList() ?? new List<string>();
+                activity.Clarification(early.Text);
+            }
+            return await FinishAsync(early.Status, early.Text, early.Reason);
         }
 
         try
@@ -332,6 +549,7 @@ public sealed class AIAgentOrchestrator
             // 3. Schema
             stage = ActivityStages.Prompt;
             var schema = await _engine.GetAllowedSchemaAsync(settings, token);
+            knownSchema = schema;
             activity.SetSchema(schema);
             if (schema.Count == 0)
                 throw new QueryExecutionException("No collections are available for querying. Check the Database and Settings pages.");
@@ -349,12 +567,13 @@ public sealed class AIAgentOrchestrator
                     + (questionDates.Ambiguous.Count > 0 ? "\nAmbiguous: " + string.Join(", ", questionDates.Ambiguous.Select(a => a.Text)) : string.Empty),
                     questionDates.Invalid.Count + questionDates.Ambiguous.Count > 0 ? "warning" : "ok");
             if (questionDates.Invalid.Count > 0)
-                return await FinishAsync(ChatStatus.Unsupported,
-                    $"\"{questionDates.Invalid[0]}\" isn't a valid date. Please check it and try again.", "Invalid date in the question");
+                return await AskAsync($"\"{questionDates.Invalid[0]}\" isn't a valid date. Which date do you mean? Please write it like 1 September 2026.",
+                    "invalidDate", null, "a valid date", questionDates.Invalid[0], "Invalid date in the question");
             if (questionDates.Ambiguous.FirstOrDefault() is { } ambiguous)
-                return await FinishAsync(ChatStatus.Unsupported,
-                    $"Did you mean {QuestionDates.Describe(ambiguous.DayFirst)} or {QuestionDates.Describe(ambiguous.MonthFirst)} for \"{ambiguous.Text}\"? Please write the date like 1 September 2026.",
-                    "Ambiguous date in the question");
+                return await AskAsync(
+                    $"Did you mean {QuestionDates.Describe(ambiguous.DayFirst)} or {QuestionDates.Describe(ambiguous.MonthFirst)} for \"{ambiguous.Text}\"?",
+                    "ambiguousDate", new[] { QuestionDates.Describe(ambiguous.DayFirst), QuestionDates.Describe(ambiguous.MonthFirst) },
+                    "the date", ambiguous.Text, "Ambiguous date in the question");
 
             // 3a. Store context: selected MySaleBooks store (verified), company-level accounting statements, all stores.
             storeScope = _stores is null ? null : await _stores.ResolveAsync(question, settings, token);
@@ -364,14 +583,21 @@ public sealed class AIAgentOrchestrator
                     storeScope.Mode == StoreMode.Missing ? "warning" : "ok");
                 activity.StoreResolved(storeScope.Mode.ToString(), storeScope.Reason, storeScope.StoreId, storeScope.StoreName);
             }
+            // The store is checked again for every message: when it changed while AYAAN waited for an answer, the
+            // current selection is used and the customer is told.
+            if (activePending?.StoreId is { } askedStore && storeScope is { Mode: StoreMode.Selected } currentStore && currentStore.StoreId != askedStore)
+            {
+                contextNote = $"The selected store changed after my question — these results are for {(string.IsNullOrWhiteSpace(currentStore.StoreName) ? "the store selected now" : currentStore.StoreName)}.";
+                trace.Add("storeChanged", "Store changed during clarification", $"Asked with store {activePending.StoreName ?? askedStore}; now {currentStore.StoreName ?? currentStore.StoreId}", "warning");
+                activity.ConversationContext("Store changed during clarification; current store used.");
+            }
             // 3c. Business terms: user language → business entity → accounting concept → collections / group fields /
             //     stored group values of THIS database ("customer" → Sundry Debtors → Ledgers.groupName "SUNDRY DEBTORS").
             semantics = BusinessTerms.Interpret(question, schema, _terms);
             if (semantics.Clarification is { } clarification && !attachmentContext.Any)
             {
                 trace.Add("businessTerms", "Business terms", semantics.Describe(), "warning");
-                activity.Clarification(clarification);
-                return await FinishAsync(ChatStatus.Unsupported, clarification, "Clarification needed: ambiguous business entity");
+                return await AskAsync(clarification, "businessTerms", null, "customers or suppliers", null, "Clarification needed: ambiguous business entity");
             }
             if (semantics.Mappings.Count > 0)
             {
@@ -447,8 +673,8 @@ public sealed class AIAgentOrchestrator
             }
 
             // 4-6. Generate → validate → (repair) → scope
-            var messages = _prompts.BuildQueryMessages(promptContext, schema, history, question,
-                attachmentContext.Any ? attachmentContext.BuildPromptSection() : null);
+            var messages = _prompts.BuildQueryMessages(promptContext, schema, history, plannerQuestion,
+                attachmentContext.Any ? attachmentContext.BuildPromptSection() : null, settings.Chat.HistoryCharBudget);
             trace.Add("queryPrompt", "Generated prompt", PromptBuilder.Render(messages));
             activity.SetPrompt(messages);
 
@@ -470,6 +696,12 @@ public sealed class AIAgentOrchestrator
 
             while (true)
             {
+                if (forcedPlan is not null)
+                {
+                    query = forcedPlan;
+                    trace.Add("forcedPlan", "Report re-run with the customer's choice", forcedPlan.Arguments?.ToJsonString() ?? string.Empty, "ok");
+                    break;
+                }
                 await sink.OnStatusAsync(attempt == 0 ? "generating_query" : "repairing",
                     attempt == 0 ? $"Generating query with {provider.Model}…" : "The query needed a fix — asking the model to correct it…", token);
 
@@ -595,9 +827,8 @@ public sealed class AIAgentOrchestrator
             if (query is { IsClarification: true })
             {
                 var askBack = SafeClarification(query.Reason, schema);
-                activity.Clarification(askBack);
                 trace.Add("clarify", "Clarification requested", query.Reason ?? string.Empty, "warning");
-                return await FinishAsync(ChatStatus.Unsupported, askBack, "Clarification needed");
+                return await AskAsync(askBack, "model", askBack == query.Reason?.Trim() ? query.Options : null, query.Missing, null, "Clarification needed");
             }
 
             // Server reports (ledger statement / stock movement): deterministic, same validation and scoping as queries.
@@ -608,7 +839,7 @@ public sealed class AIAgentOrchestrator
                 stage = ActivityStages.MongoExecution;
                 await sink.OnStatusAsync("executing", "Preparing the report…", token);
                 var outcome = await _reports.RunAsync(query, validationContext, anchors, settings, currencyDecimals, token,
-                    _activity is null ? null : ActivityRecorder.MongoComment(_activity.CorrelationId));
+                    _activity is null ? null : ActivityRecorder.MongoComment(_activity.CorrelationId), currencyCode);
                 assistant.QueryJson = query.ToJson().ToCompact();
                 assistant.Operation = log.Operation = "report";
                 assistant.Mql = log.FinalMql = string.Join("\n\n", outcome.Queries);
@@ -618,8 +849,8 @@ public sealed class AIAgentOrchestrator
                 switch (outcome.Kind)
                 {
                     case "clarify":
-                        activity.Clarification(outcome.Message ?? string.Empty);
-                        return await FinishAsync(ChatStatus.Unsupported, outcome.Message ?? UserMessages.Unsupported, "Report needs a clarification");
+                        return await AskAsync(outcome.Message ?? UserMessages.Unsupported, "report", outcome.Options, null, null, "Report needs a clarification",
+                            outcome.OptionIds, outcome.AnswerArgument is null ? null : query.Arguments?.ToJsonString(), outcome.AnswerArgument);
                     case "notfound":
                         return await FinishAsync(ChatStatus.NoResults, outcome.Message ?? "No matching records were found.", null);
                     case "ok":
@@ -635,6 +866,15 @@ public sealed class AIAgentOrchestrator
                 activity.ReportExecuted(query, outcome.Queries, outcome.Rows.Count, outcome.Truncated, outcome.ElapsedMs);
                 await sink.OnQueryAsync(QueryInfoFor(assistant), token);
                 lastPrepared = null;
+                // Item reports carry their own verified sentence (found / not stock-tracked / no movements / stock).
+                // English questions get it as written; other languages get it through the answer model.
+                if (outcome.Message is { Length: > 0 } reportAnswer)
+                {
+                    if (System.Text.RegularExpressions.Regex.IsMatch(question, @"[\u0D00-\u0D7F\u0600-\u06FF]"))
+                        return await AnswerFromRowsAsync(outcome.Rows, outcome.Columns, outcome.Truncated,
+                            reportAnswer + " " + outcome.Explanation + " Answer in the language of the question with exactly these facts.", "table", outcome.ElapsedMs);
+                    return await FinishReportAnswerAsync(outcome, reportAnswer);
+                }
                 return await AnswerFromRowsAsync(outcome.Rows, outcome.Columns, outcome.Truncated, outcome.Explanation, "table", outcome.ElapsedMs);
             }
 
@@ -971,6 +1211,7 @@ public sealed class AIAgentOrchestrator
             {
                 answer = await GenerateAnswerAsync(provider!, answerMessages, sink, assistant, token);
                 if (storeScope?.Note is { Length: > 0 } storeNote) answer = storeNote + "\n\n" + answer;
+                if (contextNote is not null) answer = contextNote + "\n\n" + answer;
                 activity.AnswerGenerated(answer);
             }
             catch (AIProviderException ex)
@@ -1002,6 +1243,83 @@ public sealed class AIAgentOrchestrator
                 trace.Add("finalResponse", "Final AI response", answer, "ok", assistant.AiAnswerTimeMs);
             }
             return await FinishAsync(ChatStatus.Success, answer.Trim(), null);
+        }
+
+        // ------------------------------------------------------------------ local: fixed answer of a server report
+
+        async Task<ChatResponse> FinishReportAnswerAsync(ReportOutcome outcome, string answer)
+        {
+            assistant.ExecutionTimeMs = log.ExecutionTimeMs = outcome.ElapsedMs;
+            assistant.ResultCount = log.ResultCount = outcome.Rows.Count;
+            assistant.Truncated = outcome.Truncated;
+            assistant.Columns = outcome.Columns;
+            activity.SetResult(outcome.Rows, outcome.Columns, outcome.Truncated);
+            var data = new JsonArray(outcome.Rows.Select(r => (JsonNode?)r.DeepClone()).ToArray());
+            assistant.DataJson = data.ToCompact();
+            if (outcome.Rows.Count > 0)
+                assistant.VisualizationJson = JsonSerializer.Serialize(VisualizationAdvisor.Decide(outcome.Rows, outcome.Columns, "table"), MessageMapper.Web);
+            trace.Add("mongoResult", $"Result ({outcome.Rows.Count} rows)", JsonHelpers.Truncate(data.ToIndented(), 8000), "ok", outcome.ElapsedMs);
+            trace.Add("finalResponse", "Answer (server report)", answer, "ok");
+            if (storeScope?.Note is { Length: > 0 } note) answer = note + "\n\n" + answer;
+            if (contextNote is not null) answer = contextNote + "\n\n" + answer;
+            activity.AnswerGenerated(answer);
+            return await FinishAsync(ChatStatus.Success, answer, null);
+        }
+
+        // ------------------------------------------------------------------ local: clarification question
+
+        // Asks the customer ONE question and remembers everything needed to continue the request: the original request,
+        // the answers so far, the question, its options and the store it was asked for.
+        async Task<ChatResponse> AskAsync(string text, string source, IEnumerable<string?>? options, string? missing, string? replaceText, string reason,
+            IReadOnlyList<string>? optionIds = null, string? plan = null, string? planArgument = null)
+        {
+            var step = activePending is null ? 1 : activePending.Step + 1;
+            if (step > Math.Max(1, settings.Chat.MaxClarificationSteps))
+            {
+                newPending = null;
+                activity.Clarification("step limit reached");
+                return await FinishAsync(ChatStatus.Clarification,
+                    "I still need a few details for this request. Please send the complete request in one message — for example the item or account, the period, and whether you want quantity or value.",
+                    reason + " (clarification step limit)");
+            }
+            List<string> opts;
+            var ids = new List<string>();
+            if (optionIds is { Count: > 0 } && options is not null)
+            {
+                // Record choices (items, ledgers) are the customer's own names: keep each paired with its verified id.
+                var pairs = options.Zip(optionIds)
+                    .Where(p => p.First is { Length: > 0 and <= 60 } o && o.IndexOfAny(new[] { '{', '}', '$', '[', ']' }) < 0)
+                    .Take(6).ToList();
+                opts = pairs.Select(p => p.First!).ToList();
+                ids = pairs.Select(p => p.Second).ToList();
+            }
+            else
+            {
+                opts = ClarificationFlow.CleanOptions(options, text, o => SafeClarification(o, knownSchema) == o);
+            }
+            newPending = new PendingClarification
+            {
+                OriginalQuestion = activePending is null ? rawQuestion : activeOriginal,
+                Question = text,
+                Options = opts,
+                OptionIds = ids,
+                Plan = plan,
+                PlanArgument = planArgument,
+                Missing = missing,
+                Source = source,
+                ReplaceText = replaceText,
+                Answers = activePending is null ? new List<ClarificationAnswer>() : activeAnswers.ToList(),
+                Step = step,
+                StoreId = storeScope?.StoreId,
+                StoreName = storeScope?.StoreName,
+                CreatedAt = activePending?.CreatedAt ?? now,
+                AskedAt = now
+            };
+            assistant.ClarificationOptions = opts;
+            activity.Clarification(text);
+            trace.Add("clarification", "Question to the customer",
+                $"{text}\nSource: {source} · step {step}" + (opts.Count > 0 ? "\nOptions: " + string.Join(" | ", opts) : string.Empty), "ok");
+            return await FinishAsync(ChatStatus.Clarification, text, reason);
         }
 
         // ------------------------------------------------------------------ local: persistence
@@ -1056,12 +1374,50 @@ public sealed class AIAgentOrchestrator
                 if (string.IsNullOrEmpty(assistant.Id)) assistant.Id = Guid.NewGuid().ToString("N");
             }
 
+            // Conversation state: the open question, the last completed request and the ids of this turn — saved with the
+            // release of the turn lease. Errors keep the open question so the customer can simply try again.
+            try
+            {
+                switch (status)
+                {
+                    case ChatStatus.Clarification:
+                        if (newPending is not null) newPending.AssistantMessageId = assistant.Id;
+                        state.Pending = newPending;
+                        break;
+                    case ChatStatus.Success or ChatStatus.NoResults:
+                        state.Pending = null;
+                        if (!string.IsNullOrEmpty(assistant.QueryJson))
+                            state.LastRequest = new LastRequestInfo { Question = question, QueryJson = assistant.QueryJson, At = assistant.CreatedAt };
+                        break;
+                    case ChatStatus.Unsupported when error is not null && error.StartsWith("Store context missing", StringComparison.Ordinal):
+                        break; // the customer selects a store and answers again: the open question stays
+                    case ChatStatus.Unsupported or ChatStatus.InvalidQuery:
+                        if (activePending is not null) state.Pending = null; // the completed request was handled (declined)
+                        break;
+                }
+                state.RecentTurns.Add(new TurnRecord
+                {
+                    ClientMessageId = string.IsNullOrWhiteSpace(request.ClientMessageId) ? null : request.ClientMessageId,
+                    UserMessageId = userMessage.Id,
+                    AssistantMessageId = assistant.Id,
+                    At = assistant.CreatedAt
+                });
+                if (state.RecentTurns.Count > 20) state.RecentTurns.RemoveRange(0, state.RecentTurns.Count - 20);
+                turn.Saved = await _states.SaveAsync(state, turn.TurnId, none);
+                if (!turn.Saved) _logger.LogWarning("Conversation state was not saved: the turn lease had expired");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to save the conversation state");
+            }
+
             // Activity log: queued for the background writer (never blocks or fails the answer).
             activity.TechnicalDetailsReturned(showTechnical);
             activity.Complete(status, assistant.Content, error, assistant, log, conversation.MessageCount, persist, total.ElapsedMilliseconds);
 
             var response = MessageMapper.ToChatResponse(conversation, userMessage, assistant,
                 settings.Chat.DeveloperMode && showTechnical ? trace : null);
+            if (response.Clarification is not null) response.Clarification.Step = newPending?.Step ?? 1;
             return showTechnical ? response : TechnicalDetailsPolicy.ForCustomer(response);
         }
     }
@@ -1229,13 +1585,14 @@ public sealed class AIAgentOrchestrator
         if (!string.IsNullOrWhiteSpace(request.ConversationId) && persist)
         {
             var existing = await _conversations.GetAsync(request.ConversationId, _user.UserId, _user.CompanyId, ct);
-            if (existing is not null)
+            if (existing is not null && ConversationService.BelongsToDatabase(existing, _user.DatabaseName))
             {
                 if (existing.MessageCount == 0 && existing.Title == "New conversation")
                     existing.Title = ConversationService.TitleFrom(question);
                 return existing;
             }
-            throw new NotFoundException("Conversation not found.");
+            // Unknown id, or one owned by another user / tenant / customer database: never continued.
+            throw ChatConversationException.ConversationNotFound();
         }
 
         var conversation = new Conversation
@@ -1243,6 +1600,7 @@ public sealed class AIAgentOrchestrator
             UserId = _user.UserId,
             CompanyId = _user.CompanyId,
             UserName = _user.DisplayName,
+            DatabaseName = _user.DatabaseName,
             Title = ConversationService.TitleFrom(question)
         };
         if (persist) await _conversations.InsertAsync(conversation, ct);
@@ -1250,15 +1608,21 @@ public sealed class AIAgentOrchestrator
         return conversation;
     }
 
-    /// <summary>Regenerate: drop the assistant message being replaced and the user question before it.</summary>
-    private async Task RemoveForRegenerateAsync(Conversation conversation, string assistantMessageId, CancellationToken ct)
+    /// <summary>Regenerate: drop the assistant message being replaced and the user question before it (returned).</summary>
+    private async Task<ChatMessage?> RemoveForRegenerateAsync(Conversation conversation, string assistantMessageId, CancellationToken ct)
     {
         var messages = await _messages.ListAsync(conversation.Id, ct);
         var index = messages.FindIndex(m => m.Id == assistantMessageId && m.Role == MessageRole.Assistant);
-        if (index < 0) return;
+        if (index < 0) return null;
         var ids = new List<string> { messages[index].Id };
-        if (index > 0 && messages[index - 1].Role == MessageRole.User) ids.Add(messages[index - 1].Id);
+        ChatMessage? user = null;
+        if (index > 0 && messages[index - 1].Role == MessageRole.User)
+        {
+            user = messages[index - 1];
+            ids.Add(user.Id);
+        }
         await _messages.DeleteAsync(ids, ct);
         conversation.MessageCount = Math.Max(0, conversation.MessageCount - ids.Count);
+        return user;
     }
 }

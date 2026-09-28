@@ -20,6 +20,25 @@ public sealed class ApiExceptionHandler : IExceptionHandler
 
     public async ValueTask<bool> TryHandleAsync(HttpContext context, Exception exception, CancellationToken ct)
     {
+        if (exception is ChatConversationException chat)
+        {
+            _logger.LogInformation("Chat request refused ({Code})", chat.Code);
+            if (context.Response.HasStarted) return true;
+            context.Response.StatusCode = chat.StatusCode;
+            return await _problems.TryWriteAsync(new ProblemDetailsContext
+            {
+                HttpContext = context,
+                Exception = exception,
+                ProblemDetails = new ProblemDetails
+                {
+                    Status = chat.StatusCode,
+                    Title = chat.StatusCode == 404 ? "Conversation not found" : "Conversation busy",
+                    Detail = chat.Message,
+                    Extensions = { ["code"] = chat.Code }
+                }
+            });
+        }
+
         var (status, title, detail) = exception switch
         {
             NotFoundException e => (StatusCodes.Status404NotFound, "Not found", e.Message),

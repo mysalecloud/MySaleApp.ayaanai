@@ -43,6 +43,10 @@ public sealed class ChatRequest
     /// <summary>"text" | "voice" | "attachment" (derived when omitted).</summary>
     [StringLength(20)] public string? InputType { get; set; }
     public VoiceInputDto? Voice { get; set; }
+    /// <summary>Client-generated id of this message: a resent (duplicate) message is answered once, never processed twice.</summary>
+    [StringLength(64)] public string? ClientMessageId { get; set; }
+    /// <summary>Assistant message this reply answers (the clarification question shown). An answer to an older question is not merged.</summary>
+    [StringLength(64)] public string? ReplyToMessageId { get; set; }
 }
 
 public sealed class VoiceInputDto
@@ -141,8 +145,39 @@ public sealed class ChatResponse
     /// <summary>Developer mode only: how the customer database was resolved (never the JWT or credentials).</summary>
     public TenantDebugDto? Tenant { get; set; }
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
-    /// <summary>True when the question was answered (including "no matching records").</summary>
-    public bool Success => Status is ChatStatus.Success or ChatStatus.NoResults;
+    /// <summary>True when the request was handled normally: answered (including "no matching records") or a question asked back.</summary>
+    public bool Success => Status is ChatStatus.Success or ChatStatus.NoResults or ChatStatus.Clarification;
+    /// <summary>How the client shows the reply: answer | clarification | info | blocked | error. Only "error" is an error.</summary>
+    public string ResponseType => ResponseTypes.For(Status);
+    /// <summary>Set when AYAAN asked a question: the question and the choices (shown as buttons).</summary>
+    public ClarificationDto? Clarification { get; set; }
+}
+
+public sealed class ClarificationDto
+{
+    public string Question { get; set; } = string.Empty;
+    public List<string> Options { get; set; } = new();
+    /// <summary>1 for the first question of a request, 2 for a follow-up question, …</summary>
+    public int Step { get; set; } = 1;
+}
+
+public static class ResponseTypes
+{
+    public const string Answer = "answer";
+    public const string Clarification = "clarification";
+    public const string Info = "info";
+    public const string Blocked = "blocked";
+    public const string Error = "error";
+
+    public static string For(ChatStatus status) => status switch
+    {
+        ChatStatus.Success or ChatStatus.NoResults => Answer,
+        ChatStatus.Clarification => Clarification,
+        ChatStatus.Unsupported => Info,
+        ChatStatus.InvalidQuery => Blocked,
+        ChatStatus.Pending => Info,
+        _ => Error
+    };
 }
 
 public sealed class TenantDebugDto
@@ -167,6 +202,9 @@ public sealed class MessageDto
     public string Content { get; set; } = string.Empty;
     public DateTime CreatedAt { get; set; }
     public ChatStatus Status { get; set; }
+    public string ResponseType => ResponseTypes.For(Status);
+    /// <summary>Clarification questions: the choices offered.</summary>
+    public List<string> Options { get; set; } = new();
     public ProviderRefDto? Provider { get; set; }
     public QueryInfoDto? Query { get; set; }
     public JsonArray? Data { get; set; }

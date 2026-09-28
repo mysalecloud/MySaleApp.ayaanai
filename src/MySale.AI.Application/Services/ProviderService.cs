@@ -22,6 +22,34 @@ public sealed class AppValidationException : Exception
     public AppValidationException(string message) : base(message) { }
 }
 
+/// <summary>
+/// A chat request that cannot run in its conversation: unknown / foreign conversation (404, ConversationNotFound),
+/// a previous message still being answered (409, ConversationBusy) or a message sent twice (409, DuplicateMessage).
+/// The message is safe to show to the customer; the code lets the client react (e.g. start a new conversation).
+/// </summary>
+public sealed class ChatConversationException : Exception
+{
+    public const string NotFound = "ConversationNotFound";
+    public const string Busy = "ConversationBusy";
+    public const string Duplicate = "DuplicateMessage";
+
+    public ChatConversationException(int statusCode, string code, string message) : base(message)
+    {
+        StatusCode = statusCode;
+        Code = code;
+    }
+
+    public int StatusCode { get; }
+    public string Code { get; }
+
+    public static ChatConversationException ConversationNotFound() => new(404, NotFound,
+        "This conversation is no longer available. Please ask your question again — it will start a new conversation.");
+    public static ChatConversationException ConversationBusy() => new(409, Busy,
+        "I'm still answering your previous message in this conversation. Please wait for it to finish.");
+    public static ChatConversationException DuplicateMessage() => new(409, Duplicate,
+        "This message was already sent and is being answered.");
+}
+
 public sealed class ProviderService
 {
     private readonly IProviderRepository _repository;

@@ -230,6 +230,28 @@ public interface IConversationRepository
     Task DeleteAsync(string id, CancellationToken ct);
 }
 
+public enum TurnStart { Started, Busy, NotOwner }
+
+/// <summary>
+/// Conversation state (open clarification, last request, turn lease). Every call is scoped to the owner
+/// (tenant CompanyId + UserId + customer database) taken from the validated token — never from the request body.
+/// </summary>
+public interface IConversationStateRepository
+{
+    /// <summary>
+    /// Takes the turn lease of the conversation (creates the state when missing). Busy = another turn of the same
+    /// conversation is still running (lease younger than <paramref name="staleAfter"/>); NotOwner = the id belongs to
+    /// another user, tenant or database.
+    /// </summary>
+    Task<(TurnStart Result, ConversationState? State)> TryBeginTurnAsync(string conversationId, string companyId, string userId,
+        string? databaseName, string turnId, DateTime now, TimeSpan staleAfter, CancellationToken ct);
+    /// <summary>Saves the state and releases the lease — only while <paramref name="turnId"/> still holds it.</summary>
+    Task<bool> SaveAsync(ConversationState state, string turnId, CancellationToken ct);
+    /// <summary>Releases the lease without changing the state (failed turns).</summary>
+    Task ReleaseAsync(string conversationId, string turnId, CancellationToken ct);
+    Task DeleteAsync(string conversationId, string companyId, string userId, CancellationToken ct);
+}
+
 public interface IMessageRepository
 {
     Task<List<ChatMessage>> ListAsync(string conversationId, CancellationToken ct);

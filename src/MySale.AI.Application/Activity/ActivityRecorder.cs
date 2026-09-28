@@ -149,6 +149,9 @@ public sealed class ActivityRecorder
 
     public void UserMessage(string id) => Safe(() => _a.UserMessageId = id);
 
+    /// <summary>How the message was connected to the conversation (answer merged into an open request, cancel, new topic…).</summary>
+    public void ConversationContext(string summary) => Safe(() => AddStage("ConversationContext", "ok", null, Text(summary, 1500)));
+
     // ------------------------------------------------------------------ AI provider + prompt
 
     public void SetProvider(ResolvedProvider p) => Safe(() =>
@@ -568,7 +571,7 @@ public sealed class ActivityRecorder
             // Errors derived from the final status (when no stage recorded one)
             if (_a.Status is ActivityStatuses.Failed or ActivityStatuses.Timeout or ActivityStatuses.Cancelled && _a.Errors.Count == 0)
                 AddError(StageFor(status), TypeFor(status), error ?? status.ToString(), null);
-            if (_a.Status is not (ActivityStatuses.Success or ActivityStatuses.NoResults or ActivityStatuses.Unsupported))
+            if (_a.Status is not (ActivityStatuses.Success or ActivityStatuses.NoResults or ActivityStatuses.Unsupported or ActivityStatuses.Clarification))
                 _a.FailedStage = _a.Errors.LastOrDefault()?.Stage ?? StageFor(status);
 
             // Generation statuses
@@ -578,7 +581,8 @@ public sealed class ActivityRecorder
                 _a.Ai.ResponseGenerationStatus = _a.Ai.ResponseGenerationStatus == "Running" ? "Failed" : "Skipped";
             if (_a.Ai.ToolSelected == "none" && _a.Query?.Operation is not null) _a.Ai.ToolSelected = "database-query";
             _a.Ai.GenerationStatus = _a.Status is ActivityStatuses.Success or ActivityStatuses.NoResults ? "Completed"
-                : _a.Status == ActivityStatuses.Unsupported ? "Declined" : "Failed";
+                : _a.Status == ActivityStatuses.Unsupported ? "Declined"
+                : _a.Status == ActivityStatuses.Clarification ? "Clarification" : "Failed";
 
             // Performance
             var p = _a.Performance;
@@ -594,7 +598,7 @@ public sealed class ActivityRecorder
                 ("ResponseGeneration", p.ResponseGenerationDurationMs), ("Other", p.OtherDurationMs)
             }.OrderByDescending(x => x.Item2).First().Item1;
 
-            AddStage(ActivityStages.Completed, _a.Status is ActivityStatuses.Success or ActivityStatuses.NoResults ? "ok" : _a.Status == ActivityStatuses.Unsupported ? "warning" : "error",
+            AddStage(ActivityStages.Completed, _a.Status is ActivityStatuses.Success or ActivityStatuses.NoResults or ActivityStatuses.Clarification ? "ok" : _a.Status == ActivityStatuses.Unsupported ? "warning" : "error",
                 totalMs, $"{_a.Status} · {totalMs} ms");
 
             ConversationActivityUpdate? conversation = null;
@@ -767,6 +771,7 @@ public sealed class ActivityRecorder
         ChatStatus.Success => ActivityStatuses.Success,
         ChatStatus.NoResults => ActivityStatuses.NoResults,
         ChatStatus.Unsupported => ActivityStatuses.Unsupported,
+        ChatStatus.Clarification => ActivityStatuses.Clarification,
         ChatStatus.InvalidQuery => ActivityStatuses.Rejected,
         ChatStatus.Timeout => ActivityStatuses.Timeout,
         ChatStatus.Error when error == "Cancelled by client" => ActivityStatuses.Cancelled,

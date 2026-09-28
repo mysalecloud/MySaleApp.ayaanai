@@ -126,7 +126,7 @@ public sealed class ActivityQueryService
         Models = await _repository.DistinctAsync("model", ct),
         Statuses = new List<string>
         {
-            ActivityStatuses.Success, ActivityStatuses.NoResults, ActivityStatuses.Unsupported, ActivityStatuses.Rejected,
+            ActivityStatuses.Success, ActivityStatuses.NoResults, ActivityStatuses.Clarification, ActivityStatuses.Unsupported, ActivityStatuses.Rejected,
             ActivityStatuses.Failed, ActivityStatuses.Timeout, ActivityStatuses.Cancelled
         },
         Stages = new List<string>

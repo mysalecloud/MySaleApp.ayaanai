@@ -173,6 +173,7 @@ public static class DependencyInjection
         services.AddSingleton<IProviderRepository, ProviderRepository>();
         services.AddSingleton<IConversationRepository, ConversationRepository>();
         services.AddSingleton<IMessageRepository, MessageRepository>();
+        services.AddSingleton<IConversationStateRepository, ConversationStateRepository>();
         services.AddSingleton<IQueryLogRepository, QueryLogRepository>();
         services.AddSingleton<ISettingsRepository, SettingsRepository>();
         services.AddSingleton<IAuditLogRepository, AuditLogRepository>();

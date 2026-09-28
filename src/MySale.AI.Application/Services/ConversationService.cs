@@ -10,12 +10,15 @@ public sealed class ConversationService
     private readonly IConversationRepository _conversations;
     private readonly IMessageRepository _messages;
     private readonly IUserContext _user;
+    private readonly IConversationStateRepository? _states;
 
-    public ConversationService(IConversationRepository conversations, IMessageRepository messages, IUserContext user)
+    public ConversationService(IConversationRepository conversations, IMessageRepository messages, IUserContext user,
+        IConversationStateRepository? states = null)
     {
         _conversations = conversations;
         _messages = messages;
         _user = user;
+        _states = states;
     }
 
     public async Task<List<ConversationSummaryDto>> ListAsync(string? search, bool? archived, CancellationToken ct)
@@ -38,6 +41,7 @@ public sealed class ConversationService
             UserId = _user.UserId,
             CompanyId = _user.CompanyId,
             UserName = _user.DisplayName,
+            DatabaseName = _user.DatabaseName,
             Title = string.IsNullOrWhiteSpace(title) ? "New conversation" : title.Trim()
         };
         await _conversations.InsertAsync(c, ct);
@@ -59,20 +63,31 @@ public sealed class ConversationService
         var c = await Load(id, ct);
         await _messages.DeleteByConversationAsync(c.Id, ct);
         await _conversations.DeleteAsync(c.Id, ct);
+        if (_states is not null) await _states.DeleteAsync(c.Id, _user.CompanyId, _user.UserId, ct);
     }
 
     public async Task ClearAsync(string id, CancellationToken ct)
     {
         var c = await Load(id, ct);
         await _messages.DeleteByConversationAsync(c.Id, ct);
+        // Cleared history also drops the open clarification: a later "Value" is not merged into a request the user no longer sees.
+        if (_states is not null) await _states.DeleteAsync(c.Id, _user.CompanyId, _user.UserId, ct);
         c.MessageCount = 0;
         c.UpdatedAt = DateTime.UtcNow;
         await _conversations.UpdateAsync(c, ct);
     }
 
     private async Task<Conversation> Load(string id, CancellationToken ct)
-        => await _conversations.GetAsync(id, _user.UserId, _user.CompanyId, ct)
-           ?? throw new NotFoundException("Conversation not found.");
+    {
+        var c = await _conversations.GetAsync(id, _user.UserId, _user.CompanyId, ct);
+        // A conversation created under another customer database is never shown (same user id in two databases).
+        if (c is null || !BelongsToDatabase(c, _user.DatabaseName)) throw new NotFoundException("Conversation not found.");
+        return c;
+    }
+
+    /// <summary>Older conversations have no database recorded; new ones must match the database of the token.</summary>
+    public static bool BelongsToDatabase(Conversation c, string? databaseName)
+        => c.DatabaseName is null || string.Equals(c.DatabaseName, databaseName, StringComparison.Ordinal);
 
     public static string TitleFrom(string question)
     {

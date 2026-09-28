@@ -33,6 +33,7 @@ public sealed class SystemDbContext
     public IMongoCollection<ProviderConfig> Providers => Database.GetCollection<ProviderConfig>("ai_providers");
     public IMongoCollection<Conversation> Conversations => Database.GetCollection<Conversation>("conversations");
     public IMongoCollection<ChatMessage> Messages => Database.GetCollection<ChatMessage>("messages");
+    public IMongoCollection<ConversationState> ConversationStates => Database.GetCollection<ConversationState>("conversation_states");
     public IMongoCollection<QueryLog> QueryLogs => Database.GetCollection<QueryLog>("query_logs");
     public IMongoCollection<AppSettings> Settings => Database.GetCollection<AppSettings>("app_settings");
     public IMongoCollection<DatabaseConfig> DatabaseConfigs => Database.GetCollection<DatabaseConfig>("database_config");
@@ -65,6 +66,9 @@ public sealed class SystemDbContext
             Builders<Attachment>.IndexKeys.Ascending(a => a.UserId).Ascending(a => a.CompanyId).Descending(a => a.CreatedAt)), cancellationToken: ct);
         await Attachments.Indexes.CreateOneAsync(new CreateIndexModel<Attachment>(
             Builders<Attachment>.IndexKeys.Ascending(a => a.ExpiresAt)), cancellationToken: ct);
+        // Conversation state (open clarification, turn lease): removed automatically when idle for 30 days.
+        await ConversationStates.Indexes.CreateOneAsync(new CreateIndexModel<ConversationState>(
+            Builders<ConversationState>.IndexKeys.Ascending(c => c.ExpiresAt), new CreateIndexOptions { ExpireAfter = TimeSpan.Zero }), cancellationToken: ct);
     }
 
     /// <summary>Indexes of the activity log (separate so a problem here never blocks the rest of the startup).</summary>
@@ -132,6 +136,14 @@ public sealed class SystemDbContext
                 {
                     cm.AutoMap();
                     cm.MapIdMember(c => c.Id); // conversation id (string, not necessarily an ObjectId)
+                });
+            }
+            if (!BsonClassMap.IsClassMapRegistered(typeof(ConversationState)))
+            {
+                BsonClassMap.RegisterClassMap<ConversationState>(cm =>
+                {
+                    cm.AutoMap();
+                    cm.MapIdMember(c => c.Id); // conversation id (ObjectId text or GUID) stored as a string
                 });
             }
             if (!BsonClassMap.IsClassMapRegistered(typeof(DatabaseConfig)))

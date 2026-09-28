@@ -13,6 +13,8 @@ public static class ActivityStatuses
     public const string Success = "Success";
     public const string NoResults = "NoResults";
     public const string Unsupported = "Unsupported";
+    /// <summary>AYAAN asked the customer a question (not an error).</summary>
+    public const string Clarification = "Clarification";
     public const string Rejected = "Rejected";
     public const string Failed = "Failed";
     public const string Timeout = "Timeout";

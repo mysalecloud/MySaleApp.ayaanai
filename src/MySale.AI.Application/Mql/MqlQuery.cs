@@ -20,6 +20,10 @@ public sealed class MqlQuery
     public string? Reason { get; set; }
     /// <summary>Arguments of a server report plan ({"type":"report","report":"ledgerStatement",…}).</summary>
     public JsonObject? Arguments { get; set; }
+    /// <summary>Clarification: choices offered to the user ({"type":"clarify","question":"…","options":["…","…"]}).</summary>
+    public List<string>? Options { get; set; }
+    /// <summary>Clarification: what is still missing, in business words.</summary>
+    public string? Missing { get; set; }
 
     public bool IsUnsupported => string.Equals(Type, "unsupported", StringComparison.OrdinalIgnoreCase);
     /// <summary>The model could not map a business term and asks the user a short question (text in <see cref="Reason"/>).</summary>
@@ -47,6 +51,8 @@ public sealed class MqlQuery
         if (Visualization is not null) o["visualization"] = Visualization;
         if (Reason is not null) o["reason"] = Reason;
         if (Arguments is not null) o["arguments"] = Arguments.DeepClone();
+        if (Options is { Count: > 0 }) o["options"] = new JsonArray(Options.Select(x => (JsonNode?)JsonValue.Create(x)).ToArray());
+        if (Missing is not null) o["missing"] = Missing;
         return o;
     }
 }
@@ -134,6 +140,13 @@ public static class MqlParser
         {
             q.Arguments = (JsonObject)root.DeepClone();
             return new MqlParseResult { Success = true, Query = q, Json = root };
+        }
+        if (q.IsClarification)
+        {
+            q.Missing = GetString(root, "missing");
+            if (Get(root, "options") is JsonArray opts)
+                q.Options = opts.Select(o => o is JsonValue v && v.TryGetValue<string>(out var t) ? t : null)
+                    .Where(t => !string.IsNullOrWhiteSpace(t)).Select(t => t!.Trim()).Take(6).ToList();
         }
         if (q.IsUnsupported || q.IsClarification)
             return new MqlParseResult { Success = true, Query = q, Json = root };

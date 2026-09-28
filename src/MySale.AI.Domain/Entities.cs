@@ -61,6 +61,8 @@ public sealed class Conversation : Entity
     /// <summary>Display name of the owner (AI dashboard lists conversations of the whole tenant).</summary>
     public string? UserName { get; set; }
     public string Title { get; set; } = "New conversation";
+    /// <summary>Customer database of the owner (MySaleBooks JWT "dbName"); a conversation is never used under another database.</summary>
+    public string? DatabaseName { get; set; }
     public bool Archived { get; set; }
     public int MessageCount { get; set; }
     public string? LastProviderName { get; set; }
@@ -80,7 +82,9 @@ public enum ChatStatus
     ProviderError,
     DatabaseError,
     Timeout,
-    Error
+    Error,
+    /// <summary>AYAAN asked the customer a question (quantity or value? which ledger?) — a normal reply, not an error.</summary>
+    Clarification
 }
 
 public sealed class ChatMessage : Entity
@@ -90,6 +94,10 @@ public sealed class ChatMessage : Entity
     public string CompanyId { get; set; } = string.Empty;
     public MessageRole Role { get; set; }
     public string Content { get; set; } = string.Empty;
+    /// <summary>User turns: the complete request after merging clarification answers ("Show my stock — stock value").</summary>
+    public string? ResolvedQuestion { get; set; }
+    /// <summary>Assistant clarification turns: the choices offered to the customer.</summary>
+    public List<string> ClarificationOptions { get; set; } = new();
     /// <summary>"text" | "voice" | "attachment"</summary>
     public string InputType { get; set; } = "text";
     public List<AttachmentRef> Attachments { get; set; } = new();
@@ -137,6 +145,8 @@ public sealed class ChatMessage : Entity
 public sealed class QueryLog : Entity
 {
     public string Question { get; set; } = string.Empty;
+    /// <summary>The request actually planned when the question answered a clarification (original request + answers).</summary>
+    public string? ResolvedQuestion { get; set; }
     public string UserId { get; set; } = string.Empty;
     public string UserName { get; set; } = string.Empty;
     public string CompanyId { get; set; } = string.Empty;
@@ -300,4 +310,87 @@ public sealed class AttachmentTable
     public List<string> ColumnTypes { get; set; } = new();
     public List<List<string?>> Rows { get; set; } = new();
     public int TotalRows { get; set; }
+}
+
+// ---------------------------------------------------------------- conversation state (clarifications, turn order)
+
+/// <summary>
+/// Server-side state of one conversation, keyed by the conversation id and owned by one tenant + user + customer
+/// database. Holds the open clarification (original request, answers so far, the question asked), the last completed
+/// request (for "show the same for last month" when history is off), a lease that serialises turns, and the ids of the
+/// recent client messages (duplicate protection). Never sent to the client as a whole.
+/// </summary>
+public sealed class ConversationState
+{
+    /// <summary>= conversation id (ObjectId text for saved conversations, a GUID for unsaved ones).</summary>
+    public string Id { get; set; } = string.Empty;
+    public string CompanyId { get; set; } = string.Empty;
+    public string UserId { get; set; } = string.Empty;
+    public string? DatabaseName { get; set; }
+    /// <summary>Turn currently being answered (lease). Null = idle.</summary>
+    public string? ActiveTurnId { get; set; }
+    public DateTime? ActiveTurnStartedAt { get; set; }
+    public long Version { get; set; }
+    public PendingClarification? Pending { get; set; }
+    public LastRequestInfo? LastRequest { get; set; }
+    public List<TurnRecord> RecentTurns { get; set; } = new();
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+    /// <summary>TTL: state of idle conversations is removed after this time.</summary>
+    public DateTime ExpiresAt { get; set; } = DateTime.UtcNow.AddDays(30);
+}
+
+/// <summary>An open question AYAAN asked, with everything needed to continue the original request.</summary>
+public sealed class PendingClarification
+{
+    /// <summary>The customer's original request (dates already corrected by earlier answers).</summary>
+    public string OriginalQuestion { get; set; } = string.Empty;
+    /// <summary>The question AYAAN asked (shown to the customer).</summary>
+    public string Question { get; set; } = string.Empty;
+    public List<string> Options { get; set; } = new();
+    /// <summary>What is missing, in business words ("stock quantity or value").</summary>
+    public string? Missing { get; set; }
+    /// <summary>model | businessTerms | ambiguousDate | invalidDate | report</summary>
+    public string Source { get; set; } = "model";
+    /// <summary>Date clarifications: the text of the original request that the answer replaces.</summary>
+    public string? ReplaceText { get; set; }
+    /// <summary>Verified record ids of the options (same order), e.g. the matching items of a stock question.</summary>
+    public List<string> OptionIds { get; set; } = new();
+    /// <summary>Server report plan (JSON arguments) that asked the question; the answer re-runs it directly.</summary>
+    public string? Plan { get; set; }
+    /// <summary>Report argument the answer fills ("item", "ledger").</summary>
+    public string? PlanArgument { get; set; }
+    /// <summary>Answers already given to earlier questions of the same request (multi-step clarification).</summary>
+    public List<ClarificationAnswer> Answers { get; set; } = new();
+    public int Step { get; set; } = 1;
+    public string? StoreId { get; set; }
+    public string? StoreName { get; set; }
+    /// <summary>Assistant message that asked the question (a reply to an older message is not merged).</summary>
+    public string? AssistantMessageId { get; set; }
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    public DateTime AskedAt { get; set; } = DateTime.UtcNow;
+}
+
+public sealed class ClarificationAnswer
+{
+    public string Question { get; set; } = string.Empty;
+    public string Reply { get; set; } = string.Empty;
+    /// <summary>The option / normalised meaning of the reply ("Value" → "stock value", "ഇന്നലെ" → "yesterday").</summary>
+    public string? Resolved { get; set; }
+    public DateTime At { get; set; } = DateTime.UtcNow;
+}
+
+public sealed class LastRequestInfo
+{
+    public string Question { get; set; } = string.Empty;
+    public string? QueryJson { get; set; }
+    public DateTime At { get; set; } = DateTime.UtcNow;
+}
+
+public sealed class TurnRecord
+{
+    public string? ClientMessageId { get; set; }
+    public string? UserMessageId { get; set; }
+    public string? AssistantMessageId { get; set; }
+    public DateTime At { get; set; } = DateTime.UtcNow;
 }

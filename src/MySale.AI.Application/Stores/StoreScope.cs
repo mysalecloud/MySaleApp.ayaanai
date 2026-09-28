@@ -31,9 +31,10 @@ public sealed class StoreFilterOptions
     /// <summary>
     /// Master collections whose records can be shared by all stores: a record with the store field set to one of
     /// <see cref="SharedStoreValues"/> (or missing) belongs to every store (MySaleBooks masters use branchId "0"; the
-    /// MySaleBooks reports load them with branchId ∈ {store, "0"}). Transactions are never in this list.
+    /// MySaleBooks reports load them with branchId ∈ {store, "0"}). StockMaster is included because the MySaleBooks Stock
+    /// screen counts the store's movement rows plus the rows with branchId "0" (opening stock entered for all stores).
     /// </summary>
-    public List<string> SharedCollections { get; set; } = new() { "Item", "Ledger", "StockLocation", "Unit", "Category", "Currency" };
+    public List<string> SharedCollections { get; set; } = new() { "Item", "Ledger", "StockLocation", "Unit", "Category", "Currency", "StockMaster" };
     public List<string> SharedStoreValues { get; set; } = new() { "0" };
 
     /// <summary>Store master used to verify the selected store and read its name. Empty = the collection named Branch/Branches.</summary>

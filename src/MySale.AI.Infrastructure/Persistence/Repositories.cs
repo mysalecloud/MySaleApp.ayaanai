@@ -134,12 +134,12 @@ public sealed class MessageRepository : IMessageRepository
     public MessageRepository(SystemDbContext db) => _db = db;
 
     public Task<List<ChatMessage>> ListAsync(string conversationId, CancellationToken ct)
-        => _db.Messages.Find(m => m.ConversationId == conversationId).SortBy(m => m.CreatedAt).ToListAsync(ct);
+        => _db.Messages.Find(m => m.ConversationId == conversationId).SortBy(m => m.CreatedAt).ThenBy(m => m.Id).ToListAsync(ct);
 
     public async Task<List<ChatMessage>> ListRecentAsync(string conversationId, int count, CancellationToken ct)
     {
         var list = await _db.Messages.Find(m => m.ConversationId == conversationId)
-            .SortByDescending(m => m.CreatedAt).Limit(count).ToListAsync(ct);
+            .SortByDescending(m => m.CreatedAt).ThenByDescending(m => m.Id).Limit(count).ToListAsync(ct);
         list.Reverse();
         return list;
     }
@@ -330,4 +330,77 @@ public sealed class SchemaMetadataRepository : ISchemaMetadataRepository
 
     public Task DeleteAsync(string collection, CancellationToken ct)
         => _db.SchemaMetadata.DeleteOneAsync(m => m.Id == collection, ct);
+}
+
+/// <summary>
+/// Conversation state in the system database ("conversation_states"). The owner (tenant + user + customer database)
+/// is part of every filter, so a conversation id of another user or tenant never matches; the turn lease is taken
+/// with one atomic find-and-update.
+/// </summary>
+public sealed class ConversationStateRepository : IConversationStateRepository
+{
+    private static readonly TimeSpan IdleLifetime = TimeSpan.FromDays(30);
+    private readonly SystemDbContext _db;
+    public ConversationStateRepository(SystemDbContext db) => _db = db;
+
+    public async Task<(TurnStart Result, ConversationState? State)> TryBeginTurnAsync(string conversationId, string companyId, string userId,
+        string? databaseName, string turnId, DateTime now, TimeSpan staleAfter, CancellationToken ct)
+    {
+        var f = Builders<ConversationState>.Filter;
+        var owner = f.Eq(s => s.Id, conversationId) & f.Eq(s => s.CompanyId, companyId) & f.Eq(s => s.UserId, userId)
+                    & f.Eq(s => s.DatabaseName, databaseName);
+        var idle = f.Eq(s => s.ActiveTurnId, (string?)null) | f.Lt(s => s.ActiveTurnStartedAt, now - staleAfter);
+        var update = Builders<ConversationState>.Update
+            .Set(s => s.ActiveTurnId, turnId)
+            .Set(s => s.ActiveTurnStartedAt, now)
+            .Set(s => s.UpdatedAt, now)
+            .Set(s => s.ExpiresAt, now + IdleLifetime)
+            .SetOnInsert(s => s.CreatedAt, now)
+            .SetOnInsert(s => s.Version, 0L);
+        try
+        {
+            var state = await _db.ConversationStates.FindOneAndUpdateAsync(owner & idle, update,
+                new FindOneAndUpdateOptions<ConversationState> { IsUpsert = true, ReturnDocument = ReturnDocument.After }, ct);
+            return state is null ? (TurnStart.Busy, null) : (TurnStart.Started, state);
+        }
+        catch (Exception ex) when (IsDuplicateKey(ex))
+        {
+            // The id exists but did not match: either another turn holds the lease or it belongs to someone else.
+            var existing = await _db.ConversationStates.Find(f.Eq(s => s.Id, conversationId)).FirstOrDefaultAsync(ct);
+            if (existing is not null && (existing.CompanyId != companyId || existing.UserId != userId
+                                         || !string.Equals(existing.DatabaseName, databaseName, StringComparison.Ordinal)))
+                return (TurnStart.NotOwner, null);
+            return (TurnStart.Busy, null);
+        }
+    }
+
+    public async Task<bool> SaveAsync(ConversationState state, string turnId, CancellationToken ct)
+    {
+        var f = Builders<ConversationState>.Filter;
+        var now = DateTime.UtcNow;
+        state.ActiveTurnId = null;
+        state.ActiveTurnStartedAt = null;
+        state.Version++;
+        state.UpdatedAt = now;
+        state.ExpiresAt = now + IdleLifetime;
+        var result = await _db.ConversationStates.ReplaceOneAsync(f.Eq(s => s.Id, state.Id) & f.Eq(s => s.ActiveTurnId, turnId), state,
+            cancellationToken: ct);
+        return result.MatchedCount > 0;
+    }
+
+    public Task ReleaseAsync(string conversationId, string turnId, CancellationToken ct)
+        => _db.ConversationStates.UpdateOneAsync(
+            Builders<ConversationState>.Filter.Eq(s => s.Id, conversationId) & Builders<ConversationState>.Filter.Eq(s => s.ActiveTurnId, turnId),
+            Builders<ConversationState>.Update.Set(s => s.ActiveTurnId, (string?)null).Set(s => s.ActiveTurnStartedAt, (DateTime?)null),
+            cancellationToken: ct);
+
+    public Task DeleteAsync(string conversationId, string companyId, string userId, CancellationToken ct)
+        => _db.ConversationStates.DeleteOneAsync(s => s.Id == conversationId && s.CompanyId == companyId && s.UserId == userId, ct);
+
+    private static bool IsDuplicateKey(Exception ex) => ex switch
+    {
+        MongoWriteException w => w.WriteError?.Category == ServerErrorCategory.DuplicateKey,
+        MongoCommandException c => c.Code == 11000,
+        _ => false
+    };
 }

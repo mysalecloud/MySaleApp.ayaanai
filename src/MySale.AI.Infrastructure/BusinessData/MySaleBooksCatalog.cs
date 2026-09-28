@@ -126,7 +126,7 @@ public static class MySaleBooksCatalog
         new CollectionSchema
         {
             Name = "Item",
-            Description = "Product master (one document per product; branchId \"0\" = shared by all branches). Use to include products without movements.",
+            Description = "Item master: products, raw materials and services (itemType; branchId \"0\" = shared by all branches). Use to include products without movements.",
             Fields = new()
             {
                 Id("Product id (referenced as a string by StockMaster.itemId)"),
@@ -134,7 +134,18 @@ public static class MySaleBooksCatalog
                 F("itemLocalName", "string", "Product name in the local language"),
                 F("itemCode", "string", "Product code"),
                 F("barcode", "string", "Barcode"),
-                F("itemType", "string", "product | rawMaterial | service (stock reports use product and rawMaterial)"),
+                F("eancode", "string", "EAN code (lower-case c)"),
+                F("partNumber", "string", "Part number"),
+                F("partNumberDetails.partNumber", "string", "Additional part numbers"),
+                F("aliasDetails.aliasName", "string", "Alias (alternative) names of the item"),
+                F("alternateUnits.unitId", "string", "Alternate selling unit", "Unit._id"),
+                F("alternateUnits.unitName", "string", "Alternate unit name"),
+                F("alternateUnits.barcode", "string", "Barcode of the alternate unit"),
+                F("alternateUnits.alternateItemCode", "string", "Item code of the alternate unit"),
+                F("alternateUnits.alternateItemName", "string", "Item name of the alternate unit"),
+                F("alternateUnits.taxExcAmount", "decimal", "Selling price of the alternate unit excluding tax"),
+                F("alternateUnits.taxIncAmount", "decimal", "Selling price of the alternate unit including tax"),
+                F("itemType", "string", "product | rawMaterial | service (stock reports use product and rawMaterial; services are not stock-tracked)"),
                 F("categoryId", "string", "Category (string of Category._id)", "Category._id"),
                 F("unitId", "string", "Stock unit of the product (StockMaster quantities are in this unit)", "Unit._id"),
                 F("costingType", "string", "Item costing type (default FIFO)"),
@@ -142,6 +153,10 @@ public static class MySaleBooksCatalog
                 F("purchaseRate", "decimal", "Purchase rate"),
                 F("taxExcAmount", "decimal", "Selling price excluding tax"),
                 F("taxIncAmount", "decimal", "Selling price including tax"),
+                F("saleTax", "decimal", "Sales tax percentage"),
+                F("minimumSellingRate", "decimal", "Minimum selling rate (0 = not set)"),
+                F("maximumSellingRate", "decimal", "Maximum selling rate (0 = not set)"),
+                F("isBatchWise", "bool", "Batch-wise stock"),
                 F("reOrderLevel", "decimal", "Reorder level (0 = not configured)"),
                 F("minimumStockQty", "decimal", "Minimum stock quantity (0 = not configured)"),
                 F("maximumStockQty", "decimal", "Maximum stock quantity (0 = not configured)"),
@@ -153,6 +168,7 @@ public static class MySaleBooksCatalog
                 F("isKotItem", "bool", "Kitchen (KOT) item — excluded from stock reports"),
                 F("status", "bool", "Active flag"),
                 F("isCanceled", "bool", "Cancelled product"),
+                F("isDeleted", "bool", "Deleted product"),
                 Branch("\"0\" = shared by all branches"),
                 Company()
             }

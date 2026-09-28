@@ -23,7 +23,8 @@ public static class MessageMapper
             Status = m.Status,
             InputType = m.InputType,
             Attachments = m.Attachments,
-            Voice = m.Voice
+            Voice = m.Voice,
+            Options = m.ClarificationOptions ?? new List<string>()
         };
         if (m.Role == MessageRole.User) return dto;
 
@@ -73,7 +74,10 @@ public static class MessageMapper
         Grounding = new GroundingDto { Checked = assistant.GroundingChecked, Warnings = assistant.GroundingWarnings },
         QueryLogId = assistant.QueryLogId,
         Debug = debug,
-        CreatedAt = assistant.CreatedAt
+        CreatedAt = assistant.CreatedAt,
+        Clarification = assistant.Status == ChatStatus.Clarification
+            ? new ClarificationDto { Question = assistant.Content, Options = assistant.ClarificationOptions ?? new List<string>() }
+            : null
     };
 
     public static QueryLogSummaryDto ToLogSummary(QueryLog l) => new()

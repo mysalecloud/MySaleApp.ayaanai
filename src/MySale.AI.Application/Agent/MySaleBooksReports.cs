@@ -20,6 +20,12 @@ public sealed class ReportOutcome
     public List<string> Queries { get; init; } = new();
     public long ElapsedMs { get; init; }
     public bool StoreContextMissing { get; init; }
+    /// <summary>Clarify: the choices (matching ledgers / products) shown as buttons.</summary>
+    public List<string>? Options { get; init; }
+    /// <summary>Clarify: verified record ids of the choices (same order) — a chosen option re-runs the report with its id.</summary>
+    public List<string>? OptionIds { get; init; }
+    /// <summary>Clarify: report argument that the customer's answer fills ("item", "ledger") — the report then runs again directly.</summary>
+    public string? AnswerArgument { get; init; }
 }
 
 /// <summary>
@@ -29,12 +35,13 @@ public sealed class ReportOutcome
 /// opening stock rows always in the opening). Every database read goes through <see cref="QueryEngine.Prepare"/>: the same
 /// validation, tenant scope, selected-store filter and cancelled-document filter as any other query.
 /// </summary>
-public sealed class MySaleBooksReports
+public sealed partial class MySaleBooksReports
 {
     private readonly QueryEngine _engine;
     public MySaleBooksReports(QueryEngine engine) => _engine = engine;
 
-    public static readonly IReadOnlySet<string> Supported = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "ledgerStatement", "stockMovement" };
+    public static readonly IReadOnlySet<string> Supported = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        { "ledgerStatement", "stockMovement", ItemStockReport, ItemDetailsReport };
 
     private sealed class Run
     {
@@ -45,7 +52,7 @@ public sealed class MySaleBooksReports
     }
 
     public async Task<ReportOutcome> RunAsync(MqlQuery plan, MqlValidationContext context, DateAnchors anchors, AppSettings settings,
-        int decimals, CancellationToken ct, string? comment = null)
+        int decimals, CancellationToken ct, string? comment = null, string? currency = null)
     {
         var args = plan.Arguments ?? new JsonObject();
         var report = Str(args["report"]);
@@ -56,9 +63,13 @@ public sealed class MySaleBooksReports
         if (periodError is not null) return new ReportOutcome { Kind = "invalid", Message = periodError };
 
         var run = new Run();
-        var outcome = string.Equals(report, "ledgerStatement", StringComparison.OrdinalIgnoreCase)
-            ? await LedgerStatementAsync(Str(args["ledger"]), from, to, context, anchors, settings, decimals, run, ct, comment)
-            : await StockMovementAsync(Str(args["item"]), from, to, context, anchors, settings, run, ct, comment);
+        var outcome = report.ToLowerInvariant() switch
+        {
+            "ledgerstatement" => await LedgerStatementAsync(Str(args["ledger"]), from, to, context, anchors, settings, decimals, run, ct, comment),
+            "itemstock" => await ItemStockAsync(args, anchors, context, settings, decimals, currency, run, ct, comment),
+            "itemdetails" => await ItemDetailsAsync(args, context, settings, decimals, currency, run, ct, comment),
+            _ => await StockMovementAsync(Str(args["item"]), Str(args["itemId"]), from, to, context, anchors, settings, run, ct, comment)
+        };
         if (run.StoreMissing) return new ReportOutcome { Kind = "blocked", StoreContextMissing = true, Queries = run.Queries };
         if (run.Error is not null) return new ReportOutcome { Kind = "blocked", Message = run.Error, Queries = run.Queries, ElapsedMs = run.Ms };
         return outcome;
@@ -70,14 +81,15 @@ public sealed class MySaleBooksReports
         DateAnchors anchors, AppSettings settings, int decimals, Run run, CancellationToken ct, string? comment)
     {
         if (string.IsNullOrWhiteSpace(ledgerText))
-            return Clarify("Which ledger (customer, supplier, cash, bank or other account) should I show the statement for?", run);
+            return Clarify("Which ledger (customer, supplier, cash, bank or other account) should I show the statement for?", run, answerArgument: "ledger");
 
         var ledgers = await FindAsync("Ledger", "ledgerName", ledgerText,
             new JsonObject { ["ledgerName"] = 1, ["groupName"] = 1, ["opBalanceDebit"] = 1, ["opBalanceCredit"] = 1 }, context, settings, run, ct, comment);
         if (run.Error is not null || run.StoreMissing) return new ReportOutcome();
         if (ledgers.Count == 0) return new ReportOutcome { Kind = "notfound", Message = $"I couldn't find a ledger named \"{ledgerText.Trim()}\".", Queries = run.Queries };
         if (ledgers.Count > 1)
-            return Clarify($"Which ledger do you mean: {string.Join(", ", ledgers.Take(5).Select(l => Str(l["ledgerName"])))}?", run);
+            return Clarify($"Which ledger do you mean: {string.Join(", ", ledgers.Take(5).Select(l => Str(l["ledgerName"])))}?", run,
+                ledgers.Take(5).Select(l => Str(l["ledgerName"])).Where(n => n is not null).Select(n => n!).ToList(), "ledger");
 
         var ledger = ledgers[0];
         var ledgerId = Str(ledger["_id"])!;
@@ -186,23 +198,29 @@ public sealed class MySaleBooksReports
 
     // ------------------------------------------------------------------ stock movement
 
-    private async Task<ReportOutcome> StockMovementAsync(string? itemText, DateOnly from, DateOnly to, MqlValidationContext context,
+    private async Task<ReportOutcome> StockMovementAsync(string? itemText, string? chosenItemId, DateOnly from, DateOnly to, MqlValidationContext context,
         DateAnchors anchors, AppSettings settings, Run run, CancellationToken ct, string? comment)
     {
-        if (string.IsNullOrWhiteSpace(itemText))
-            return Clarify("Which product should I show the stock movement for?", run);
+        if (string.IsNullOrWhiteSpace(itemText) && chosenItemId is null)
+            return Clarify("Which product should I show the stock movement for? You can type its name, code or barcode.", run, answerArgument: "item");
 
-        var items = await FindAsync("Item", "itemName", itemText, new JsonObject { ["itemName"] = 1, ["itemCode"] = 1, ["unitId"] = 1 },
-            context, settings, run, ct, comment, codeFields: new[] { "itemCode", "barcode" });
+        // Same item resolution as the stock report: codes / barcodes, exact name, never a silent partial match.
+        var match = await ResolveItemAsync(itemText, chosenItemId, context, settings, run, ct, comment);
         if (run.Error is not null || run.StoreMissing) return new ReportOutcome();
-        if (items.Count == 0) return new ReportOutcome { Kind = "notfound", Message = $"I couldn't find a product named \"{itemText.Trim()}\".", Queries = run.Queries };
-        if (items.Count > 1)
-            return Clarify($"Which product do you mean: {string.Join(", ", items.Take(5).Select(i => Str(i["itemName"])))}?", run);
+        var (item, stop) = Pick(match, itemText, run, "item");
+        if (stop is not null) return stop;
+        if (!IsStockTracked(item!))
+            return new ReportOutcome
+            {
+                Kind = "ok",
+                Message = $"“{Str(item!["itemName"]) ?? CleanItemText(itemText)}” is a {KindOf(item!)} that is not stock-tracked, so it has no stock movements.",
+                Queries = run.Queries,
+                ElapsedMs = run.Ms
+            };
 
-        var item = items[0];
-        var itemId = Str(item["_id"])!;
-        var itemName = Str(item["itemName"]) ?? itemText.Trim();
-        var unit = await UnitNameAsync(Str(item["unitId"]), context, settings, run, ct, comment);
+        var itemId = Str(item!["_id"])!;
+        var itemName = Str(item["itemName"]) ?? CleanItemText(itemText);
+        var unit = (await UnitInfoAsync(Str(item["unitId"]), context, settings, run, ct, comment)).Name;
         var range = DateAnchors.ForLocalDays(from, to, anchors.BoundaryTimeZoneId);
 
         JsonObject Qty(string pipe, string field) => new()
@@ -388,7 +406,8 @@ public sealed class MySaleBooksReports
         return result;
     }
 
-    private static ReportOutcome Clarify(string question, Run run) => new() { Kind = "clarify", Message = question, Queries = run.Queries };
+    private static ReportOutcome Clarify(string question, Run run, List<string>? options = null, string? answerArgument = null)
+        => new() { Kind = "clarify", Message = question, Queries = run.Queries, Options = options, AnswerArgument = answerArgument };
 
     private static (DateOnly From, DateOnly To, string? Error) Period(JsonObject args, DateAnchors anchors)
     {

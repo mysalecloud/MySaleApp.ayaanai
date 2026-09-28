@@ -179,7 +179,8 @@ public class MySaleBooksScopingTests
             """, Msb.Store());
         Assert.True(p.IsExecutable, string.Join("; ", p.Validation.Errors));
         var json = p.ScopedPipeline!.ToJsonString();
-        Assert.Contains("{\"branchId\":\"" + Msb.StoreA + "\"}", json);                         // stock rows of the store only
+        // Stock rows of the store plus branch "0" rows, like the MySaleBooks Stock screen.
+        Assert.Contains("{\"branchId\":{\"$in\":[\"" + Msb.StoreA + "\",\"0\",null]}}", json);
         var lookup = p.ScopedPipeline!.OfType<JsonObject>().Single(s => s.ContainsKey("$lookup"))["$lookup"]!.ToJsonString();
         Assert.Contains("\"$in\":[\"" + Msb.StoreA + "\",\"0\",null]", lookup);                // shared products (branchId "0") stay visible
     }

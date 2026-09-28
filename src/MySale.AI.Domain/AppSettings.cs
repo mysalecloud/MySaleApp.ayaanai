@@ -45,6 +45,12 @@ public sealed class ChatSettings
     public bool DeveloperMode { get; set; } = true;
     /// <summary>Previous messages included as context for follow-up questions.</summary>
     public int HistoryMessages { get; set; } = 6;
+    /// <summary>Minutes an unanswered clarification question stays open (then the customer is asked for the full request).</summary>
+    public int ClarificationMinutes { get; set; } = 30;
+    /// <summary>Follow-up questions for one request before AYAAN asks for the complete request in one message.</summary>
+    public int MaxClarificationSteps { get; set; } = 4;
+    /// <summary>Characters of earlier turns sent to the model (oldest turns are dropped first; the open request never is).</summary>
+    public int HistoryCharBudget { get; set; } = 12000;
 }
 
 /// <summary>Speech-to-text. Uses an OpenAI-compatible /audio/transcriptions endpoint (OpenAI, or a local Whisper server).</summary>

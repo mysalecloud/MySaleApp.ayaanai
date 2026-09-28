@@ -261,6 +261,7 @@ public sealed class Harness
     public AIAgentOrchestrator Orchestrator { get; }
     public FakeRequestContext Request { get; } = new();
     public FakeSchema Schema { get; } = new();
+    public InMemoryConversationStateRepository States { get; } = new();
 
     public Harness(IAIActivitySink? activitySink = null, ActivityOptions? activityOptions = null, ISecretProtector? activityProtector = null,
         MySale.AI.Application.Stores.IStoreSelection? storeSelection = null, MySale.AI.Application.Stores.IStoreAccessProvider? storeAccess = null)
@@ -287,7 +288,8 @@ public sealed class Harness
                 : new MySale.AI.Application.Stores.StoreContextResolver(User, storeSelection,
                     storeAccess ?? new MySale.AI.Application.Stores.UnknownStoreAccessProvider(), new MySale.AI.Application.Stores.StoreFilterOptions(), engine),
             companies: new CompanyContextService(engine, User),
-            reports: new MySaleBooksReports(engine));
+            reports: new MySaleBooksReports(engine),
+            states: States);
     }
 }
 

@@ -78,10 +78,21 @@ public static class ZeroResultPolicy
         (new(@"\b(last|past|previous)\s+(\d+)\s+days\b", RegexOptions.IgnoreCase), " in the last {n} days", "Last {n} days'"),
     };
 
+    private static readonly Regex StockWords = new(@"\b(stock|inventory|on\s+hand|in\s+hand|available|left)\b|സ്റ്റോക്ക|مخزون", RegexOptions.IgnoreCase);
+    private static readonly Regex TradeWords = new(@"\b(sold|sell|selling|sales?|purchas\w*|bought)\b", RegexOptions.IgnoreCase);
+
     public static ZeroResult Describe(string question, JsonArray? pipeline, string? collection, QuestionDates? dates, string? currency, int decimals = 2)
     {
         var zeroRow = pipeline is null ? null : ZeroRowFor(pipeline);
         var (period, possessive) = PeriodOf(question, dates);
+
+        // Stock of named items: no rows can mean "no such item" as well as "no movements" — never show stock 0 for it.
+        if (zeroRow is not null && collection is "StockMaster" or "Item" && StockWords.IsMatch(question) && !TradeWords.IsMatch(question))
+            return new ZeroResult
+            {
+                ZeroRow = null,
+                Message = "I couldn't find stock for what you asked about. Please check the item name, item code or barcode — an item that is not found is not the same as zero stock."
+            };
 
         // Localised generic messages (the question language decides).
         if (Regex.IsMatch(question, @"[ഀ-ൿ]"))
