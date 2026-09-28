@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Mvc.Filters;
 using MySale.AI.Application.Abstractions;
 using MySale.AI.Application.ActivityTracking;
 using MySale.AI.Application.AIDashboard;
+using MySale.AI.Infrastructure.Security;
 
 namespace MySale.AI.Api.Security;
 
@@ -50,7 +51,9 @@ public sealed class HttpAIDashboardCallerAccessor : IAIDashboardCallerAccessor
             Token = _user.IsMySaleBooksUser ? BearerToken(ctx) : null,
             IpAddress = ctx?.Connection.RemoteIpAddress?.ToString(),
             CorrelationId = _request.CorrelationId,
-            ClaimTypes = (Claim(AgentClaims.SourceClaimTypes) ?? string.Empty).Split(',', StringSplitOptions.RemoveEmptyEntries)
+            ClaimTypes = (Claim(AgentClaims.SourceClaimTypes) ?? string.Empty).Split(',', StringSplitOptions.RemoveEmptyEntries),
+            // Validated by AIDashboardAuthorizationFilter before this object is built; absent = no AYAAN session.
+            Ayaan = ctx?.Items[AIDashboardAuthorizationFilter.AyaanItemKey] as AyaanDashboardSession ?? AyaanDashboardSession.Missing
         };
     }
 
@@ -64,32 +67,37 @@ public sealed class HttpAIDashboardCallerAccessor : IAIDashboardCallerAccessor
 }
 
 /// <summary>
-/// Server-side gate of every AIDashboard endpoint: authenticated → tenant → MySaleBooks permission → section permission.
-/// Hiding the menu in React is not relied on: a direct API call without the permission gets 403.
+/// Server-side gate of every AIDashboard endpoint: MySaleBooks authentication (JWT in Authorization, tenant from its dbName)
+/// + the existing AYAAN Dashboard authentication (session token in X-Ayaan-Session). There is no AIDashboard permission
+/// check. Hiding the page in React is not relied on: a direct API call without both layers gets 401.
+/// The argument names the section (for the audit log), it is not a permission.
 /// </summary>
-public sealed class AIDashboardPermissionAttribute : TypeFilterAttribute
+public sealed class AIDashboardAuthorizeAttribute : TypeFilterAttribute
 {
-    public AIDashboardPermissionAttribute(string permission, bool auditDenied = true) : base(typeof(AIDashboardPermissionFilter))
-        => Arguments = new object[] { permission, auditDenied };
+    public AIDashboardAuthorizeAttribute(string section, bool auditDenied = true) : base(typeof(AIDashboardAuthorizationFilter))
+        => Arguments = new object[] { section, auditDenied };
 }
 
-public sealed class AIDashboardPermissionFilter : IAsyncAuthorizationFilter
+public sealed class AIDashboardAuthorizationFilter : IAsyncAuthorizationFilter
 {
     public const string AccessItemKey = "ai-dashboard-access";
+    public const string AyaanItemKey = "ai-dashboard-ayaan-session";
 
-    private readonly string _permission;
+    private readonly string _section;
     private readonly bool _auditDenied;
     private readonly AIDashboardAccessService _access;
+    private readonly AyaanDashboardSessionValidator _ayaan;
     private readonly IAIDashboardCallerAccessor _caller;
     private readonly IAuditLogRepository _audit;
-    private readonly ILogger<AIDashboardPermissionFilter> _logger;
+    private readonly ILogger<AIDashboardAuthorizationFilter> _logger;
 
-    public AIDashboardPermissionFilter(string permission, bool auditDenied, AIDashboardAccessService access, IAIDashboardCallerAccessor caller,
-        IAuditLogRepository audit, ILogger<AIDashboardPermissionFilter> logger)
+    public AIDashboardAuthorizationFilter(string section, bool auditDenied, AIDashboardAccessService access, AyaanDashboardSessionValidator ayaan,
+        IAIDashboardCallerAccessor caller, IAuditLogRepository audit, ILogger<AIDashboardAuthorizationFilter> logger)
     {
-        _permission = permission;
+        _section = section;
         _auditDenied = auditDenied;
         _access = access;
+        _ayaan = ayaan;
         _caller = caller;
         _audit = audit;
         _logger = logger;
@@ -104,15 +112,19 @@ public sealed class AIDashboardPermissionFilter : IAsyncAuthorizationFilter
 
         try
         {
-            http.Items[AccessItemKey] = await _access.AuthorizeAsync(_permission, http.RequestAborted);
+            // Layer 2: the existing AYAAN Dashboard session (validated before the caller object is built).
+            http.Items[AyaanItemKey] = await _ayaan.ValidateAsync(http.Request.Headers[AyaanDashboardSessionValidator.HeaderName].ToString(),
+                http.RequestAborted);
+            // Layer 1 (MySaleBooks JWT + tenant) and layer 2 are both enforced here.
+            http.Items[AccessItemKey] = await _access.AuthorizeAsync(_section, http.RequestAborted);
         }
         catch (AIDashboardAccessException ex)
         {
-            if (_auditDenied && ex.StatusCode != 401)
+            if (_auditDenied && (ex.StatusCode != 401 || ex.Code.StartsWith("ayaan_", StringComparison.Ordinal)))
             {
                 try
                 {
-                    await _audit.InsertAsync(AIDashboardService.DeniedEntry(_caller.Current, AIDashboardPermissions.SectionOf(_permission), ex.Code),
+                    await _audit.InsertAsync(AIDashboardService.DeniedEntry(_caller.Current, AIDashboardPermissions.SectionOf(_section), ex.Code),
                         http.RequestAborted);
                 }
                 catch (Exception auditError) when (auditError is not OperationCanceledException)
@@ -137,9 +149,9 @@ public sealed class AIDashboardPermissionFilter : IAsyncAuthorizationFilter
 
 public static class AIDashboardHttpExtensions
 {
-    /// <summary>The access object stored by <see cref="AIDashboardPermissionFilter"/> (always present inside an AIDashboard action).</summary>
+    /// <summary>The access object stored by <see cref="AIDashboardAuthorizationFilter"/> (always present inside an AIDashboard action).</summary>
     public static AIDashboardAccess GetAIDashboardAccess(this HttpContext http)
-        => http.Items[AIDashboardPermissionFilter.AccessItemKey] as AIDashboardAccess
+        => http.Items[AIDashboardAuthorizationFilter.AccessItemKey] as AIDashboardAccess
            ?? throw AIDashboardAccessException.Forbidden();
 }
 
