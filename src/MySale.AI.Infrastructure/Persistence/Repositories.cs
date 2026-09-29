@@ -397,6 +397,14 @@ public sealed class ConversationStateRepository : IConversationStateRepository
     public Task DeleteAsync(string conversationId, string companyId, string userId, CancellationToken ct)
         => _db.ConversationStates.DeleteOneAsync(s => s.Id == conversationId && s.CompanyId == companyId && s.UserId == userId, ct);
 
+    public async Task<ConversationState?> GetAsync(string conversationId, string companyId, string userId, string? databaseName, CancellationToken ct)
+    {
+        var f = Builders<ConversationState>.Filter;
+        var owner = f.Eq(s => s.Id, conversationId) & f.Eq(s => s.CompanyId, companyId) & f.Eq(s => s.UserId, userId)
+                    & f.Eq(s => s.DatabaseName, databaseName);
+        return await _db.ConversationStates.Find(owner).FirstOrDefaultAsync(ct);
+    }
+
     private static bool IsDuplicateKey(Exception ex) => ex switch
     {
         MongoWriteException w => w.WriteError?.Category == ServerErrorCategory.DuplicateKey,

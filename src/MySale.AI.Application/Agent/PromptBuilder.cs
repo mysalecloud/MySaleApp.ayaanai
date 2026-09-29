@@ -47,7 +47,7 @@ public sealed class PromptBuilder
     /// Prompt template version, recorded with every AI activity. Bump it whenever the query / answer prompts change,
     /// so answers can be compared across prompt revisions.
     /// </summary>
-    public const string Version = "ayaan-prompts-2026.09.9"; // .2 ids; .3 tolerant text; .4 store; .5 dates/customers/zero; .6 business terms; .7 MySaleBooks rules/currency/wall-clock dates; .8 conversation memory/clarifications; .9 item stock/details reports
+    public const string Version = "ayaan-prompts-2026.09.10"; // .2 ids; .3 tolerant text; .4 store; .5 dates/customers/zero; .6 business terms; .7 MySaleBooks rules/currency/wall-clock dates; .8 conversation memory/clarifications; .9 item stock/details reports; .10 conversation state (intent, parameters, shown answers)
 
     // ------------------------------------------------------------------ step 1: question -> MQL
 
@@ -57,7 +57,8 @@ public sealed class PromptBuilder
         IReadOnlyList<ChatMessage> history,
         string question,
         string? attachmentSection = null,
-        int historyCharBudget = 12_000)
+        int historyCharBudget = 12_000,
+        string? conversationState = null)
     {
         // Follow-ups ("and last month?") are short; include the previous questions when ranking collections.
         var rankingText = string.Join(' ', history.Where(m => m.Role == MessageRole.User).Select(m => m.ResolvedQuestion ?? m.Content).Append(question));
@@ -66,6 +67,9 @@ public sealed class PromptBuilder
             rankingText += " " + string.Join(' ', sem.Mappings.SelectMany(m => m.Collections.Concat(m.GroupFields.Select(g => g.Collection))));
         var system = BuildQuerySystemPrompt(ctx with { Question = rankingText }, schema);
         if (!string.IsNullOrWhiteSpace(attachmentSection)) system += "\n" + attachmentSection;
+        // Structured state kept by the server (intent, collected parameters, summary of earlier requests): the model
+        // continues the active request from it instead of relying on an unlimited transcript.
+        if (!string.IsNullOrWhiteSpace(conversationState)) system += "\n\n" + conversationState;
         var messages = new List<AIChatMessage> { AIChatMessage.System(system) };
 
         // Previous turns: the complete request of each turn (after clarification answers) → the query JSON that was used,
@@ -116,6 +120,9 @@ public sealed class PromptBuilder
 
     private static string AssistantTurn(ChatMessage m)
     {
+        // What the customer actually saw is part of the context: an answer that ended with "Do you want it by ledger
+        // balance?" must be visible to the model, or a following "yes" looks like a message without any context.
+        var shown = string.IsNullOrWhiteSpace(m.Content) ? null : Clip(m.Content.Trim(), 300);
         if (m.Status == ChatStatus.Clarification)
         {
             var o = new System.Text.Json.Nodes.JsonObject { ["type"] = "clarify", ["question"] = Clip(m.Content, 400) };
@@ -125,15 +132,37 @@ public sealed class PromptBuilder
         }
         if (!string.IsNullOrEmpty(m.QueryJson))
         {
-            if (m.QueryJson.Length <= 4_000) return m.QueryJson;
+            if (m.QueryJson.Length <= 4_000)
+            {
+                if (shown is null) return m.QueryJson;
+                try
+                {
+                    if (System.Text.Json.Nodes.JsonNode.Parse(m.QueryJson) is System.Text.Json.Nodes.JsonObject query)
+                    {
+                        query["shownToUser"] = shown;
+                        return query.ToJsonString();
+                    }
+                }
+                catch (System.Text.Json.JsonException)
+                {
+                    // stored query is not valid JSON: shown as stored
+                }
+                return m.QueryJson;
+            }
             return new System.Text.Json.Nodes.JsonObject
             {
                 ["type"] = "query",
                 ["collection"] = m.Collection,
-                ["explanation"] = Clip(m.Explanation ?? "earlier query (shortened)", 400)
+                ["explanation"] = Clip(m.Explanation ?? "earlier query (shortened)", 400),
+                ["shownToUser"] = shown
             }.ToJsonString();
         }
-        return "{\"type\":\"unsupported\",\"reason\":\"previous question could not be answered\"}";
+        return new System.Text.Json.Nodes.JsonObject
+        {
+            ["type"] = "unsupported",
+            ["reason"] = "answered without a database query",
+            ["shownToUser"] = shown
+        }.ToJsonString();
     }
 
     private static string Clip(string text, int max) => text.Length <= max ? text : text[..max] + "…";
@@ -497,6 +526,7 @@ public sealed class PromptBuilder
         system.AppendLine("- Rows may contain both an id and its mapped name (customerId + customerName, productId + productName, branchId + branchName …). Always refer to customers, products, branches, salespeople, suppliers, invoices, categories and warehouses by their name or number. Do not show internal IDs (24-character codes such as 68b3758… or GUIDs) when a name is available.");
         system.AppendLine("- If a record has only an id and no name, you may say the name is not available (optionally with the id); never invent or guess a name for an id.");
         system.AppendLine("- If the result was truncated, mention that only the first records are shown.");
+        system.AppendLine("- Do not end with a question and do not offer options: if the data could be read in more than one way (for example ledger balance vs unpaid invoices), say which one you used. The app offers follow-up choices itself.");
         // Example uses the verified currency / precision (never a hard-coded currency: it would leak into answers without one).
         var zeroMoney = 0m.ToString("N" + Math.Clamp(ctx.CurrencyDecimals, 0, 6), System.Globalization.CultureInfo.InvariantCulture);
         var zeroExample = ctx.CurrencyMissing is null && !string.IsNullOrWhiteSpace(ctx.Currency) ? ctx.Currency + " " + zeroMoney : zeroMoney;

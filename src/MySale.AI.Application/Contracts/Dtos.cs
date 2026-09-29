@@ -47,6 +47,43 @@ public sealed class ChatRequest
     [StringLength(64)] public string? ClientMessageId { get; set; }
     /// <summary>Assistant message this reply answers (the clarification question shown). An answer to an older question is not merged.</summary>
     [StringLength(64)] public string? ReplyToMessageId { get; set; }
+    /// <summary>
+    /// A clicked option of the open question: its structured value ("UNPAID_INVOICE_AGE", "YES") decides the answer —
+    /// the visible label is never parsed. Only values the server offered for the open question are accepted.
+    /// </summary>
+    public ClarificationChoiceDto? Choice { get; set; }
+}
+
+/// <summary>One selectable answer of a clarification question.</summary>
+public sealed class ClarificationChoiceDto
+{
+    [StringLength(200)] public string DisplayText { get; set; } = string.Empty;
+    [StringLength(100)] public string Value { get; set; } = string.Empty;
+}
+
+/// <summary>Conversation context for restoring the chat after a reload (never the whole server state).</summary>
+public sealed class ConversationContextDto
+{
+    public string ConversationId { get; set; } = string.Empty;
+    /// <summary>Business intent of the active request (DEBTORS_REPORT, SALES, STOCK …).</summary>
+    public string? Intent { get; set; }
+    public string Stage { get; set; } = "NEW_REQUEST";
+    /// <summary>The open question, when AYAAN is waiting for an answer; null otherwise.</summary>
+    public PendingClarificationDto? Pending { get; set; }
+}
+
+public sealed class PendingClarificationDto
+{
+    public string Question { get; set; } = string.Empty;
+    /// <summary>choice | yesNo | open | date</summary>
+    public string Kind { get; set; } = "open";
+    public List<ClarificationChoiceDto> Choices { get; set; } = new();
+    public int Step { get; set; } = 1;
+    /// <summary>Assistant message that asked the question (the client sends it back as replyToMessageId).</summary>
+    public string? MessageId { get; set; }
+    /// <summary>True for a follow-up offer at the end of an answer ("Do you want it by ledger balance?").</summary>
+    public bool FollowUp { get; set; }
+    public DateTime AskedAt { get; set; }
 }
 
 public sealed class VoiceInputDto
@@ -156,7 +193,14 @@ public sealed class ChatResponse
 public sealed class ClarificationDto
 {
     public string Question { get; set; } = string.Empty;
+    /// <summary>Labels of the choices (kept for older clients; new clients use <see cref="Choices"/>).</summary>
     public List<string> Options { get; set; } = new();
+    /// <summary>The choices with their structured values — send the value back as <c>choice</c> when one is clicked.</summary>
+    public List<ClarificationChoiceDto> Choices { get; set; } = new();
+    /// <summary>choice | yesNo | open | date</summary>
+    public string Kind { get; set; } = "open";
+    /// <summary>True when the question is a follow-up offer at the end of an answer (the answer itself is complete).</summary>
+    public bool FollowUp { get; set; }
     /// <summary>1 for the first question of a request, 2 for a follow-up question, …</summary>
     public int Step { get; set; } = 1;
 }
@@ -205,6 +249,8 @@ public sealed class MessageDto
     public string ResponseType => ResponseTypes.For(Status);
     /// <summary>Clarification questions: the choices offered.</summary>
     public List<string> Options { get; set; } = new();
+    /// <summary>Structured value of each option (same order).</summary>
+    public List<string> OptionValues { get; set; } = new();
     public ProviderRefDto? Provider { get; set; }
     public QueryInfoDto? Query { get; set; }
     public JsonArray? Data { get; set; }

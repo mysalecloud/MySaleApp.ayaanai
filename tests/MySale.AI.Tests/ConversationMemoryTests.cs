@@ -404,7 +404,7 @@ public class ConversationClarificationTests
         var h = New();
         h.Provider.QueryResponses.Enqueue(_ => AskQuantityOrValue);
         var first = await Send(h, "Show my stock");
-        h.States.Mutate(first.ConversationId, s => s.Pending!.AskedAt = DateTime.UtcNow.AddHours(-2));
+        h.States.Mutate(first.ConversationId, s => s.Pending!.AskedAt = DateTime.UtcNow.AddHours(-6));   // default: open for 4 hours
         var calls = h.Provider.Requests.Count;
 
         var r = await Send(h, "Value", first.ConversationId);

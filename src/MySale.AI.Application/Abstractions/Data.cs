@@ -250,6 +250,8 @@ public interface IConversationStateRepository
     /// <summary>Releases the lease without changing the state (failed turns).</summary>
     Task ReleaseAsync(string conversationId, string turnId, CancellationToken ct);
     Task DeleteAsync(string conversationId, string companyId, string userId, CancellationToken ct);
+    /// <summary>Reads the state of the owner's conversation (null = none, or another owner's). Used to restore an open question after a reload.</summary>
+    Task<ConversationState?> GetAsync(string conversationId, string companyId, string userId, string? databaseName, CancellationToken ct);
 }
 
 public interface IMessageRepository

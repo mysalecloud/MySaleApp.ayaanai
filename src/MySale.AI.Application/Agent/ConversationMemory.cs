@@ -44,9 +44,12 @@ public static class ClarificationFlow
         ("both", new[] { "both", "all", "everything", "രണ്ടും", "എല്ലാം" }),
         ("today", new[] { "today", "ഇന്ന്", "ഇന്നത്തെ" }),
         ("yesterday", new[] { "yesterday", "ഇന്നലെ", "ഇന്നലത്തെ" }),
-        ("first", new[] { "first", "1st", "former", "ആദ്യത്തേത്", "ആദ്യത്തെ", "ഒന്നാമത്തെ" }),
-        ("second", new[] { "second", "2nd", "latter", "രണ്ടാമത്തേത്", "രണ്ടാമത്തെ" }),
-        ("third", new[] { "third", "3rd", "മൂന്നാമത്തെ" })
+        ("first", new[] { "first", "1st", "1", "former", "ആദ്യത്തേത്", "ആദ്യത്തെ", "ഒന്നാമത്തെ" }),
+        ("second", new[] { "second", "2nd", "2", "latter", "രണ്ടാമത്തേത്", "രണ്ടാമത്തെ" }),
+        ("third", new[] { "third", "3rd", "3", "മൂന്നാമത്തെ" }),
+        // Report types: "age wise", "ageing", "aging" → the invoice-age option; "ledger" → the ledger-balance option.
+        ("age", new[] { "age", "ageing", "aging", "aged", "agewise", "overdue" }),
+        ("ledger", new[] { "ledger", "ledgers", "ledgerwise" })
     };
 
     // Malayalam / mixed period phrases → English (the date anchors and the planner understand the English words).
@@ -76,6 +79,7 @@ public static class ClarificationFlow
     {
         "the", "a", "an", "i", "want", "wanted", "need", "meant", "mean", "show", "me", "my", "please", "only", "just", "in", "of",
         "for", "it", "that", "this", "one", "is", "was", "actually", "sorry", "give", "see", "like", "would", "to", "and", "by",
+        "wise", "based", "basis", "on", "using", "option", "go", "with", "use", "choose", "select", "pick",
         "മതി", "mathi", "വേണം", "venam", "കാണിക്കൂ", "കാണിക്കുക", "തരൂ", "ആണ്", "aanu", "ok"
     };
 
@@ -165,12 +169,37 @@ public static class ClarificationFlow
             .Concat(pending.Options).Concat(pending.Answers.Select(a => a.Reply + " " + a.Resolved)));
         var newTopics = TopicsOf(reply).Except(TopicsOf(context)).ToList();
         var words = WordCount(reply);
+        // A name given to an open "which account / customer / item / warehouse …?" question is an answer even when it
+        // contains a subject word ("Cash in hand", "Sales account") — unless it is phrased as a request or a question.
+        var entityAnswer = pending.Options.Count == 0 && pending.Parameter is "account" or "customer" or "supplier" or "item" or "warehouse" or "branch"
+                           && !RequestLead.IsMatch(reply);
         // A subject the open request never mentioned ("Show my sales" while AYAAN asked about stock) is a new question.
         // Short open answers without a question form ("Bank" to "which account?") stay answers.
-        if (newTopics.Count > 0 && (RequestLead.IsMatch(reply) || words >= 3 || pending.Options.Count > 0))
+        if (newTopics.Count > 0 && !entityAnswer && (RequestLead.IsMatch(reply) || words >= 3 || pending.Options.Count > 0))
+            return ReplyKind.NewTopic;
+        // A complete request for a different business intent ("What are today's sales?" while AYAAN waits for the
+        // debtors report type) is a new request, even when the open question happens to mention a related word.
+        var replyIntent = ConversationIntents.Detect(reply);
+        var openIntent = pending.Intent ?? ConversationIntents.Detect(pending.OriginalQuestion);
+        if (replyIntent is not null && openIntent is not null && !entityAnswer && !RelatedIntents(replyIntent, openIntent)
+            && (RequestLead.IsMatch(reply) || words >= 3))
             return ReplyKind.NewTopic;
         return ReplyKind.Answer;
     }
+
+    private static readonly string[][] IntentFamilies =
+    {
+        new[] { "DEBTORS_REPORT", "CUSTOMER_BALANCE", "CUSTOMERS", "OUTSTANDING_REPORT", "LEDGER", "VOUCHERS" },
+        new[] { "CREDITORS_REPORT", "SUPPLIER_BALANCE", "SUPPLIERS", "OUTSTANDING_REPORT", "LEDGER", "VOUCHERS" },
+        new[] { "STOCK", "ITEMS", "SERVICE_ITEMS" },
+        new[] { "SALES", "SALES_RETURN", "SALES_ORDER" },
+        new[] { "PURCHASES", "PURCHASE_RETURN", "PURCHASE_ORDER" },
+        new[] { "ACCOUNTS", "LEDGER", "VOUCHERS", "EXPENSES", "INCOME", "PROFIT" }
+    };
+
+    /// <summary>Same intent, or intents of the same business area (debtors report ↔ customer balance ↔ ledger).</summary>
+    public static bool RelatedIntents(string a, string b)
+        => a == b || IntentFamilies.Any(f => f.Contains(a) && f.Contains(b));
 
     /// <summary>
     /// A message that only makes sense as the answer to a question ("Value", "Yes", "Both", "Yesterday", "ഇന്നലെ").
@@ -183,8 +212,9 @@ public static class ClarificationFlow
         if (Regex.IsMatch(normalized, @"^\s*(this|last)\s+(month|week|year)\s*[.!?]?\s*$", Opt)) return true;
         var tokens = Tokens(normalized).ToList();
         if (tokens.Count is 0 or > 3) return false;
+        if (ReplyInterpreter.IsAffirmativeOnly(text) || ReplyInterpreter.IsNo(text)) return true;   // "continue", "that one", "same", "go ahead"
         var bare = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "yes", "no", "both", "value", "quantity", "today", "yesterday", "first", "second", "third", "total" };
+            { "yes", "no", "both", "value", "quantity", "today", "yesterday", "first", "second", "third", "total", "age" };
         var content = tokens.Where(t => !Filler.Contains(t.Raw) || Canon(t.Raw) is "yes").ToList();
         return content.Count > 0 && content.All(t => bare.Contains(Canon(t.Raw)));
     }
@@ -271,6 +301,8 @@ public static class ClarificationFlow
             sb.Append("- You asked: \"").Append(a.Question).Append("\" → the user answered: \"").Append(a.Reply).Append('"');
             if (!string.IsNullOrWhiteSpace(a.Resolved) && !string.Equals(a.Resolved, a.Reply, StringComparison.OrdinalIgnoreCase))
                 sb.Append(" (meaning: ").Append(a.Resolved).Append(')');
+            if (!string.IsNullOrWhiteSpace(a.Value))
+                sb.Append(" [selected: ").Append(a.Parameter is { Length: > 0 } p ? p + " = " : string.Empty).Append(a.Value).Append(']');
             sb.AppendLine();
         }
         return new MergedRequest(analysis, sb.ToString().TrimEnd());
@@ -304,6 +336,8 @@ public static class ClarificationFlow
             Question = a.Question,
             Reply = Swap(a.Reply),
             Resolved = a.Resolved is null ? null : Swap(a.Resolved),
+            Value = a.Value,
+            Parameter = a.Parameter,
             At = a.At
         }).ToList();
         if (!found) newOriginal = ReplaceDate(original, null, chosen);
@@ -316,12 +350,18 @@ public static class ClarificationFlow
         Question = p.Question,
         Options = p.Options.ToList(),
         OptionIds = p.OptionIds.ToList(),
+        OptionValues = p.OptionValues.ToList(),
+        Kind = p.Kind,
+        Parameter = p.Parameter,
+        Intent = p.Intent,
+        Soft = p.Soft,
+        Repeats = p.Repeats,
         Plan = p.Plan,
         PlanArgument = p.PlanArgument,
         Missing = p.Missing,
         Source = p.Source,
         ReplaceText = p.ReplaceText,
-        Answers = p.Answers.Select(a => new ClarificationAnswer { Question = a.Question, Reply = a.Reply, Resolved = a.Resolved, At = a.At }).ToList(),
+        Answers = p.Answers.Select(a => new ClarificationAnswer { Question = a.Question, Reply = a.Reply, Resolved = a.Resolved, Value = a.Value, Parameter = a.Parameter, At = a.At }).ToList(),
         Step = p.Step,
         StoreId = p.StoreId,
         StoreName = p.StoreName,
@@ -443,6 +483,17 @@ public sealed class InMemoryConversationStateRepository : IConversationStateRepo
                 _states.TryRemove(conversationId, out _);
         }
         return Task.CompletedTask;
+    }
+
+    public Task<ConversationState?> GetAsync(string conversationId, string companyId, string userId, string? databaseName, CancellationToken ct)
+    {
+        lock (_lock)
+        {
+            if (!_states.TryGetValue(conversationId, out var s) || s.CompanyId != companyId || s.UserId != userId
+                || !string.Equals(s.DatabaseName, databaseName, StringComparison.Ordinal))
+                return Task.FromResult<ConversationState?>(null);
+            return Task.FromResult<ConversationState?>(Copy(s));
+        }
     }
 
     /// <summary>Test helper: changes the stored state (e.g. makes an open question older).</summary>

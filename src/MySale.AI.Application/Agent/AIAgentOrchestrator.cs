@@ -313,6 +313,10 @@ public sealed class AIAgentOrchestrator
         var conversationNotes = new List<string>();
         IReadOnlyList<CollectionSchema> knownSchema = Array.Empty<CollectionSchema>();
         var earlyAnchors = DateAnchors.Compute(now, _user.TimeZone, _calendar.FinancialYearStartMonth, _calendar.IsWallClock(_user.IsMySaleBooksUser));
+        // Clicked option: its structured value decides (the visible label is never parsed).
+        var choice = request.Choice is { Value.Length: > 0 } clicked ? new StructuredChoice(clicked.Value.Trim(), clicked.DisplayText) : null;
+        // Clarification state machine of this turn (recorded in the trace, the activity log and the conversation state).
+        var flow = new List<string> { ConversationStages.NewRequest };
 
         if (regeneratedResolved is not null)
         {
@@ -321,7 +325,18 @@ public sealed class AIAgentOrchestrator
         }
         else if (state.Pending is { } pending)
         {
-            var kind = ClarificationFlow.Classify(rawQuestion, pending);
+            // Pending clarification has priority: the message is first read as an answer to the open question. A clicked
+            // option or a reply that matches an option is always an answer; only a message that clearly does not answer
+            // (a different request, "cancel") is treated as new.
+            var isDateQuestion = pending.Source is "ambiguousDate" or "invalidDate";
+            var previousValue = pending.Parameter is { } previousParameter && state.PreviousParameters.TryGetValue(previousParameter, out var pv) ? pv : null;
+            var interpretation = isDateQuestion ? null : ReplyInterpreter.Interpret(rawQuestion, pending, choice, previousValue);
+            var choseOption = interpretation is { Outcome: ReplyOutcome.Resolved, Value: not null };
+            var kind = choseOption ? ReplyKind.Answer : ClarificationFlow.Classify(rawQuestion, pending);
+            // A follow-up offer at the end of an answer is answered only by a short contextual reply ("yes", "ledger",
+            // "the second one"); any other message is a new request and the offer is dropped.
+            if (pending.Soft && kind == ReplyKind.Answer && !choseOption && !ReplyInterpreter.IsContextual(rawQuestion))
+                kind = ReplyKind.NewTopic;
             if (kind == ReplyKind.Answer && request.ReplyToMessageId is { Length: > 0 } replyTo
                 && pending.AssistantMessageId is { Length: > 0 } askedIn && replyTo != askedIn)
             {
@@ -352,7 +367,13 @@ public sealed class AIAgentOrchestrator
                         break;
                     case ReplyKind.NewTopic:
                         state.Pending = null;
-                        conversationNotes.Add("New topic — the open request was dropped: " + ClarificationFlow.Short(pending.OriginalQuestion, 200));
+                        if (!pending.Soft)
+                        {
+                            // Suspended, not lost: "continue" / "go back" brings the question back later.
+                            state.Suspended = ClarificationFlow.Copy(pending);
+                            conversationNotes.Add("New topic — the open request was suspended: " + ClarificationFlow.Short(pending.OriginalQuestion, 200));
+                        }
+                        else conversationNotes.Add("New request — the follow-up offer was dropped: " + ClarificationFlow.Short(pending.Question, 200));
                         break;
                     default:
                         if (pending.Source is "ambiguousDate" or "invalidDate")
@@ -375,11 +396,44 @@ public sealed class AIAgentOrchestrator
                         }
                         else
                         {
+                            var declinesRecordChoice = pending.Plan is { Length: > 0 } && ReplyInterpreter.IsNo(rawQuestion);
+                            if (pending.Soft && (interpretation?.Value == "NO" || (interpretation?.Outcome == ReplyOutcome.NeedsChoice && ReplyInterpreter.IsNo(rawQuestion))))
+                            {
+                                // "No" to a follow-up offer: nothing to run.
+                                state.Pending = null;
+                                earlyReply = (ChatStatus.Success, "Okay, I'll leave it as it is.", null);
+                                conversationNotes.Add("Follow-up offer declined: " + ClarificationFlow.Short(pending.Question, 200));
+                                break;
+                            }
+                            if (interpretation is { Outcome: ReplyOutcome.NeedsChoice } && !declinesRecordChoice)
+                            {
+                                // "yes" / "ok" / "that one" to a question with several options (or no value for an open
+                                // question): never guessed — the same question is asked again, the request stays open.
+                                newPending = ClarificationFlow.Copy(pending);
+                                newPending.AskedAt = now;
+                                newPending.Repeats++;
+                                earlyReply = (ChatStatus.Clarification, ReplyInterpreter.ChooseAgain(pending), "Reply did not choose an option");
+                                conversationNotes.Add($"“{ClarificationFlow.Short(rawQuestion, 40)}” does not choose an option of “{pending.Question}” — asked again; {pending.Intent ?? "request"} stays open.");
+                                break;
+                            }
                             activeOriginal = pending.OriginalQuestion;
                             activeAnswers = ClarificationFlow.Copy(pending).Answers;
-                            var resolved = ClarificationFlow.Resolve(rawQuestion, pending);
-                            activeAnswers.Add(new ClarificationAnswer { Question = pending.Question, Reply = rawQuestion, Resolved = resolved, At = now });
-                            conversationNotes.Add($"Answer to “{pending.Question}”: “{rawQuestion}”" + (resolved is null ? string.Empty : $" (= {resolved})") + $" · step {pending.Step}.");
+                            var resolved = interpretation?.Resolved ?? ClarificationFlow.Resolve(rawQuestion, pending);
+                            if (resolved is not null && string.Equals(resolved, rawQuestion.Trim(), StringComparison.Ordinal)) resolved = null;
+                            activeAnswers.Add(new ClarificationAnswer
+                            {
+                                Question = pending.Question, Reply = choice?.DisplayText is { Length: > 0 } label && choseOption ? label : rawQuestion,
+                                Resolved = resolved, Value = interpretation?.Value, Parameter = pending.Parameter, At = now
+                            });
+                            if (pending.Parameter is { } answeredParameter)
+                            {
+                                state.Parameters[answeredParameter] = interpretation?.Value ?? resolved ?? ClarificationFlow.Short(rawQuestion, 100);
+                                state.Unresolved.Remove(answeredParameter);
+                            }
+                            flow.Add(ConversationStages.ClarificationResolved);
+                            conversationNotes.Add($"Answer to “{pending.Question}”: “{rawQuestion}”" + (resolved is null ? string.Empty : $" (= {resolved})") +
+                                                  (interpretation?.Value is { } chosenValue ? $" [{chosenValue}]" : string.Empty) + $" · step {pending.Step}" +
+                                                  (pending.Intent is null ? "." : $" · continues {pending.Intent}."));
 
                             // A question asked by a server report (which item? which ledger?): the answer fills the report
                             // argument and the report runs again with the verified record id — no model call, no re-guessing.
@@ -387,11 +441,15 @@ public sealed class AIAgentOrchestrator
                                 && JsonNode.Parse(planJson) is JsonObject planArgs)
                             {
                                 var chosen = resolved is null ? -1 : pending.Options.FindIndex(o => string.Equals(o, resolved, StringComparison.OrdinalIgnoreCase));
-                                if (chosen < 0 && pending.Options.Count > 0 && resolved == "no")
+                                if (chosen < 0 && interpretation?.Value is { Length: > 0 } structured)
+                                    chosen = pending.OptionValues.FindIndex(v => string.Equals(v, structured, StringComparison.Ordinal));
+                                if (chosen < 0 && pending.Options.Count > 0 && (resolved == "no" || declinesRecordChoice))
                                 {
                                     newPending = ClarificationFlow.Copy(pending);
                                     newPending.Options = new List<string>();
                                     newPending.OptionIds = new List<string>();
+                                    newPending.OptionValues = new List<string>();
+                                    newPending.Kind = ClarificationTypes.Open;
                                     newPending.Question = planArg == "ledger"
                                         ? "Please type the exact ledger (account) name."
                                         : "Please type the item's exact name, item code or barcode.";
@@ -425,9 +483,19 @@ public sealed class AIAgentOrchestrator
         }
         else if (ClarificationFlow.IsCancel(rawQuestion) && (request.Attachments?.Count ?? 0) == 0)
         {
+            state.Suspended = null;
             earlyReply = (ChatStatus.Success, "There's no open request to cancel. What would you like to know?", null);
         }
-        else if (history.Count == 0 && (request.Attachments?.Count ?? 0) == 0 && ClarificationFlow.IsBareReply(rawQuestion))
+        else if (state.Suspended is { } suspended && ReplyInterpreter.IsResume(rawQuestion) && (request.Attachments?.Count ?? 0) == 0)
+        {
+            // "continue" / "go back" after a change of subject: the suspended question is asked again (nothing guessed).
+            newPending = ClarificationFlow.Copy(suspended);
+            newPending.AskedAt = now;
+            state.Suspended = null;
+            earlyReply = (ChatStatus.Clarification, suspended.Question, "Suspended request resumed");
+            conversationNotes.Add("Suspended request resumed: " + ClarificationFlow.Short(suspended.OriginalQuestion, 200));
+        }
+        else if (history.Count == 0 && state.LastRequest is null && (request.Attachments?.Count ?? 0) == 0 && ClarificationFlow.IsBareReply(rawQuestion))
         {
             earlyReply = (ChatStatus.Clarification,
                 $"I'm not sure what “{ClarificationFlow.Short(rawQuestion, 40)}” refers to — there's no earlier question in this conversation for it to answer. " +
@@ -435,6 +503,22 @@ public sealed class AIAgentOrchestrator
                 "Short reply without conversation context");
             conversationNotes.Add("Short reply without an open question or earlier turns — asked for the full request.");
         }
+
+        // Intent of this turn: the open request's intent when this message answered it; otherwise the intent the
+        // message names; a follow-up without its own subject ("the same for last month") keeps the previous intent.
+        var currentIntent = activePending is not null
+            ? activePending.Intent ?? ConversationIntents.Detect(activePending.OriginalQuestion) ?? state.Intent
+            : newPending is not null && earlyReply is not null
+                ? newPending.Intent ?? state.Intent
+                : ConversationIntents.Detect(rawQuestion) ?? state.Intent;
+        if (activePending is null && earlyReply is null)
+        {
+            // A new request starts with no collected parameters (the previous request's stay available for "same").
+            state.Parameters = new Dictionary<string, string>();
+            state.Unresolved = new List<string>();
+        }
+        if (currentIntent is not null && flow.Count == 1) flow.Add(ConversationStages.IntentDetected);
+        state.Intent = currentIntent;
 
         // Unified input: typed text, voice (already transcribed) and attachments all become one request.
         var attachmentsCurrent = new List<Attachment>();
@@ -529,6 +613,8 @@ public sealed class AIAgentOrchestrator
             if (early.Status == ChatStatus.Clarification)
             {
                 assistant.ClarificationOptions = newPending?.Options.ToList() ?? new List<string>();
+                assistant.ClarificationValues = newPending?.OptionValues.ToList() ?? new List<string>();
+                assistant.ClarificationKind = newPending?.Kind;
                 activity.Clarification(early.Text);
             }
             return await FinishAsync(early.Status, early.Text, early.Reason);
@@ -673,8 +759,10 @@ public sealed class AIAgentOrchestrator
             }
 
             // 4-6. Generate → validate → (repair) → scope
+            flow.Add(ConversationStages.ParametersChecked);
             var messages = _prompts.BuildQueryMessages(promptContext, schema, history, plannerQuestion,
-                attachmentContext.Any ? attachmentContext.BuildPromptSection() : null, settings.Chat.HistoryCharBudget);
+                attachmentContext.Any ? attachmentContext.BuildPromptSection() : null, settings.Chat.HistoryCharBudget,
+                ConversationStatePrompt.Build(state, currentIntent, flow[^1], state.Parameters));
             trace.Add("queryPrompt", "Generated prompt", PromptBuilder.Render(messages));
             activity.SetPrompt(messages);
 
@@ -1297,8 +1385,20 @@ public sealed class AIAgentOrchestrator
             {
                 opts = ClarificationFlow.CleanOptions(options, text, o => SafeClarification(o, knownSchema) == o);
             }
+            // Finite questions get selectable options with structured values; a yes/no question gets Yes / No.
+            var questionKind = ClarificationTypes.KindOf(text, opts, source);
+            if (questionKind == ClarificationTypes.YesNo && opts.Count == 0) opts = new List<string> { "Yes", "No" };
+            var values = questionKind == ClarificationTypes.YesNo && ClarificationTypes.IsYesNoPair(opts)
+                ? opts.Select(o => o.TrimStart().StartsWith("y", StringComparison.OrdinalIgnoreCase) ? "YES" : "NO").ToList()
+                : ClarificationTypes.ValuesFor(opts, ids.Count > 0);
+            var parameter = ClarificationTypes.ParameterOf(text, opts, questionKind, planArgument);
+            if (parameter is not null && !state.Unresolved.Contains(parameter)) state.Unresolved.Add(parameter);
             newPending = new PendingClarification
             {
+                Kind = questionKind,
+                Parameter = parameter,
+                Intent = currentIntent,
+                OptionValues = values,
                 OriginalQuestion = activePending is null ? rawQuestion : activeOriginal,
                 Question = text,
                 Options = opts,
@@ -1316,6 +1416,9 @@ public sealed class AIAgentOrchestrator
                 AskedAt = now
             };
             assistant.ClarificationOptions = opts;
+            assistant.ClarificationValues = values;
+            assistant.ClarificationKind = questionKind;
+            flow.Add(ConversationStages.ClarificationRequired);
             activity.Clarification(text);
             trace.Add("clarification", "Question to the customer",
                 $"{text}\nSource: {source} · step {step}" + (opts.Count > 0 ? "\nOptions: " + string.Join(" | ", opts) : string.Empty), "ok");
@@ -1328,6 +1431,42 @@ public sealed class AIAgentOrchestrator
         {
             total.Stop();
             var none = CancellationToken.None; // always persist, even if the client disconnected
+
+            // An answer that ends with a question ("… Do you want it by unpaid invoice age instead?") keeps that question
+            // as a follow-up offer linked to this request, so "yes" / "the second one" continue it (and never look like a
+            // message without context). Only for answers produced for the request, not for fixed server replies.
+            PendingClarification? followUp = null;
+            if (status == ChatStatus.Success && earlyReply is null && AnswerFollowUps.TrailingQuestion(answer) is { } offer)
+            {
+                var offerOptions = ClarificationFlow.OptionsFrom(offer);
+                var offerKind = ClarificationTypes.KindOf(offer, offerOptions, "answerFollowUp");
+                if (offerKind == ClarificationTypes.YesNo && offerOptions.Count == 0) offerOptions = new List<string> { "Yes", "No" };
+                followUp = new PendingClarification
+                {
+                    OriginalQuestion = question,
+                    Question = offer,
+                    Options = offerOptions,
+                    OptionValues = offerKind == ClarificationTypes.YesNo
+                        ? offerOptions.Select(o => o.StartsWith("y", StringComparison.OrdinalIgnoreCase) ? "YES" : "NO").ToList()
+                        : ClarificationTypes.ValuesFor(offerOptions, false),
+                    Kind = offerKind,
+                    Parameter = ClarificationTypes.ParameterOf(offer, offerOptions, offerKind, null),
+                    Intent = currentIntent,
+                    Source = "answerFollowUp",
+                    Soft = true,
+                    StoreId = storeScope?.StoreId,
+                    StoreName = storeScope?.StoreName,
+                    CreatedAt = now,
+                    AskedAt = now
+                };
+                if (offerOptions.Count > 0)
+                {
+                    assistant.ClarificationOptions = followUp.Options.ToList();
+                    assistant.ClarificationValues = followUp.OptionValues.ToList();
+                    assistant.ClarificationKind = offerKind;
+                }
+                trace.Add("followUp", "Follow-up offer kept", offer + (offerOptions.Count > 0 ? "\nOptions: " + string.Join(" | ", offerOptions) : string.Empty), "ok");
+            }
 
             assistant.Status = status;
             assistant.Content = answer;
@@ -1383,11 +1522,26 @@ public sealed class AIAgentOrchestrator
                     case ChatStatus.Clarification:
                         if (newPending is not null) newPending.AssistantMessageId = assistant.Id;
                         state.Pending = newPending;
+                        flow.Add(ConversationStages.WaitingForUser);
                         break;
                     case ChatStatus.Success or ChatStatus.NoResults:
-                        state.Pending = null;
+                        if (followUp is not null) followUp.AssistantMessageId = assistant.Id;
+                        state.Pending = followUp;
                         if (!string.IsNullOrEmpty(assistant.QueryJson))
+                        {
                             state.LastRequest = new LastRequestInfo { Question = question, QueryJson = assistant.QueryJson, At = assistant.CreatedAt };
+                            flow.Add(ConversationStages.ExecuteQuery);
+                        }
+                        if (earlyReply is null)
+                        {
+                            flow.Add(ConversationStages.PresentResult);
+                            state.PreviousParameters = new Dictionary<string, string>(state.Parameters);
+                            state.Unresolved = new List<string>();
+                            var summary = (currentIntent is null ? string.Empty : currentIntent + ": ") + ClarificationFlow.Short(question, 160) +
+                                          (state.Parameters.Count > 0 ? " [" + string.Join(", ", state.Parameters.Select(p => p.Key + "=" + p.Value)) + "]" : string.Empty);
+                            state.Summary.Add(summary);
+                            if (state.Summary.Count > 5) state.Summary.RemoveRange(0, state.Summary.Count - 5);
+                        }
                         break;
                     case ChatStatus.Unsupported when error is not null && error.StartsWith("Store context missing", StringComparison.Ordinal):
                         break; // the customer selects a store and answers again: the open question stays
@@ -1395,6 +1549,15 @@ public sealed class AIAgentOrchestrator
                         if (activePending is not null) state.Pending = null; // the completed request was handled (declined)
                         break;
                 }
+                if (earlyReply is null || status == ChatStatus.Clarification)
+                {
+                    state.LastUserRequest = ClarificationFlow.Short(question, 400);
+                    state.LastAssistantText = ClarificationFlow.Short(answer, 400);
+                }
+                state.Stage = flow[^1];
+                trace.Add("stateMachine", "Conversation state", string.Join(" → ", flow) + (currentIntent is null ? string.Empty : $"\nIntent: {currentIntent}") +
+                    (state.Parameters.Count > 0 ? "\nParameters: " + string.Join("; ", state.Parameters.Select(p => p.Key + " = " + p.Value)) : string.Empty) +
+                    (state.Pending is { } open ? $"\nWaiting for: {open.Question} ({open.Kind}{(open.Soft ? ", follow-up offer" : string.Empty)})" : string.Empty), "ok");
                 state.RecentTurns.Add(new TurnRecord
                 {
                     ClientMessageId = string.IsNullOrWhiteSpace(request.ClientMessageId) ? null : request.ClientMessageId,
@@ -1582,6 +1745,14 @@ public sealed class AIAgentOrchestrator
 
     private async Task<Conversation> LoadOrCreateConversationAsync(ChatRequest request, string question, bool persist, CancellationToken ct)
     {
+        // A reply to a question AYAAN asked, sent without the conversation id (client state lost, e.g. an older client
+        // after a reload): the conversation is recovered from the question's message — only the owner's conversation.
+        if (string.IsNullOrWhiteSpace(request.ConversationId) && persist && !string.IsNullOrWhiteSpace(request.ReplyToMessageId)
+            && await _messages.GetAsync(request.ReplyToMessageId, ct) is { Role: MessageRole.Assistant } askedIn
+            && await _conversations.GetAsync(askedIn.ConversationId, _user.UserId, _user.CompanyId, ct) is { } owned
+            && ConversationService.BelongsToDatabase(owned, _user.DatabaseName))
+            return owned;
+
         if (!string.IsNullOrWhiteSpace(request.ConversationId) && persist)
         {
             var existing = await _conversations.GetAsync(request.ConversationId, _user.UserId, _user.CompanyId, ct);

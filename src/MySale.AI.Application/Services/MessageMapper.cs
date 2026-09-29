@@ -24,7 +24,8 @@ public static class MessageMapper
             InputType = m.InputType,
             Attachments = m.Attachments,
             Voice = m.Voice,
-            Options = m.ClarificationOptions ?? new List<string>()
+            Options = m.ClarificationOptions ?? new List<string>(),
+            OptionValues = m.ClarificationValues ?? new List<string>()
         };
         if (m.Role == MessageRole.User) return dto;
 
@@ -75,10 +76,31 @@ public static class MessageMapper
         QueryLogId = assistant.QueryLogId,
         Debug = debug,
         CreatedAt = assistant.CreatedAt,
-        Clarification = assistant.Status == ChatStatus.Clarification
-            ? new ClarificationDto { Question = assistant.Content, Options = assistant.ClarificationOptions ?? new List<string>() }
-            : null
+        Clarification = ToClarification(assistant)
     };
+
+    /// <summary>
+    /// The question and its selectable choices: for clarification replies, and for answers that end with a follow-up
+    /// offer ("Do you want it by ledger balance instead?"), so the customer can click instead of typing.
+    /// </summary>
+    public static ClarificationDto? ToClarification(ChatMessage assistant)
+    {
+        var options = assistant.ClarificationOptions ?? new List<string>();
+        var followUp = assistant.Status != ChatStatus.Clarification;
+        if (followUp && options.Count == 0) return null;
+        var values = assistant.ClarificationValues ?? new List<string>();
+        return new ClarificationDto
+        {
+            Question = followUp ? FollowUpQuestion(assistant.Content) : assistant.Content,
+            Options = options.ToList(),
+            Choices = options.Select((o, i) => new ClarificationChoiceDto { DisplayText = o, Value = i < values.Count ? values[i] : o }).ToList(),
+            Kind = assistant.ClarificationKind ?? "open",
+            FollowUp = followUp
+        };
+    }
+
+    private static string FollowUpQuestion(string answer)
+        => MySale.AI.Application.Agent.AnswerFollowUps.TrailingQuestion(answer) ?? string.Empty;
 
     public static QueryLogSummaryDto ToLogSummary(QueryLog l) => new()
     {

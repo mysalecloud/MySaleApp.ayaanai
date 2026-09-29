@@ -98,6 +98,10 @@ public sealed class ChatMessage : Entity
     public string? ResolvedQuestion { get; set; }
     /// <summary>Assistant clarification turns: the choices offered to the customer.</summary>
     public List<string> ClarificationOptions { get; set; } = new();
+    /// <summary>Structured value of each choice (same order): "UNPAID_INVOICE_AGE", "YES", "OPTION_2" — sent back when clicked.</summary>
+    public List<string> ClarificationValues { get; set; } = new();
+    /// <summary>choice | yesNo | open | date — how the question is answered.</summary>
+    public string? ClarificationKind { get; set; }
     /// <summary>"text" | "voice" | "attachment"</summary>
     public string InputType { get; set; } = "text";
     public List<AttachmentRef> Attachments { get; set; } = new();
@@ -332,7 +336,27 @@ public sealed class ConversationState
     public DateTime? ActiveTurnStartedAt { get; set; }
     public long Version { get; set; }
     public PendingClarification? Pending { get; set; }
+    /// <summary>
+    /// An open question that was set aside because the customer changed the subject ("What are today's sales?" while
+    /// AYAAN waited for the debtors report type). "continue" / "go back" brings it back; a new question replaces it.
+    /// </summary>
+    public PendingClarification? Suspended { get; set; }
     public LastRequestInfo? LastRequest { get; set; }
+    /// <summary>Business intent of the active (or last) request: DEBTORS_REPORT, SALES, STOCK … (see ConversationIntents).</summary>
+    public string? Intent { get; set; }
+    /// <summary>Clarification state machine: NEW_REQUEST → … → WAITING_FOR_USER → CLARIFICATION_RESOLVED → … → PRESENT_RESULT.</summary>
+    public string Stage { get; set; } = "NEW_REQUEST";
+    /// <summary>Parameters collected for the active request (reportType = UNPAID_INVOICE_AGE, period = this month …).</summary>
+    public Dictionary<string, string> Parameters { get; set; } = new();
+    /// <summary>Parameters of the last completed request ("same" / "previous" reuse them).</summary>
+    public Dictionary<string, string> PreviousParameters { get; set; } = new();
+    /// <summary>Parameters AYAAN still asks for (the open question's parameter).</summary>
+    public List<string> Unresolved { get; set; } = new();
+    /// <summary>The previous user request (complete, after clarification answers) and the reply shown for it.</summary>
+    public string? LastUserRequest { get; set; }
+    public string? LastAssistantText { get; set; }
+    /// <summary>Short summary of the latest completed requests (newest last, at most 5) — context without unlimited history.</summary>
+    public List<string> Summary { get; set; } = new();
     public List<TurnRecord> RecentTurns { get; set; } = new();
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
@@ -350,8 +374,23 @@ public sealed class PendingClarification
     public List<string> Options { get; set; } = new();
     /// <summary>What is missing, in business words ("stock quantity or value").</summary>
     public string? Missing { get; set; }
-    /// <summary>model | businessTerms | ambiguousDate | invalidDate | report</summary>
+    /// <summary>model | businessTerms | ambiguousDate | invalidDate | report | answerFollowUp</summary>
     public string Source { get; set; } = "model";
+    /// <summary>choice (fixed options) | yesNo | open (a name, period, amount …) | date. See ClarificationTypes.</summary>
+    public string Kind { get; set; } = "open";
+    /// <summary>What the answer fills: reportType, measure, period, warehouse, branch, customer, supplier, item, account, confirm …</summary>
+    public string? Parameter { get; set; }
+    /// <summary>Business intent of the request this question belongs to (DEBTORS_REPORT, SALES, STOCK …).</summary>
+    public string? Intent { get; set; }
+    /// <summary>Structured value of each option (same order as Options): "UNPAID_INVOICE_AGE", "YES", "OPTION_1" …</summary>
+    public List<string> OptionValues { get; set; } = new();
+    /// <summary>
+    /// A follow-up offer at the end of an answer ("Do you want it by ledger balance instead?"). Only a short contextual
+    /// reply ("yes", "the second one", "ledger") answers it; any other message is a new request.
+    /// </summary>
+    public bool Soft { get; set; }
+    /// <summary>How many times the same question was asked again because the reply did not choose an option.</summary>
+    public int Repeats { get; set; }
     /// <summary>Date clarifications: the text of the original request that the answer replaces.</summary>
     public string? ReplaceText { get; set; }
     /// <summary>Verified record ids of the options (same order), e.g. the matching items of a stock question.</summary>
@@ -377,6 +416,10 @@ public sealed class ClarificationAnswer
     public string Reply { get; set; } = string.Empty;
     /// <summary>The option / normalised meaning of the reply ("Value" → "stock value", "ഇന്നലെ" → "yesterday").</summary>
     public string? Resolved { get; set; }
+    /// <summary>Structured value of the chosen option ("UNPAID_INVOICE_AGE", "YES") when the reply chose one.</summary>
+    public string? Value { get; set; }
+    /// <summary>Parameter the answer filled (reportType, period, warehouse …).</summary>
+    public string? Parameter { get; set; }
     public DateTime At { get; set; } = DateTime.UtcNow;
 }
 

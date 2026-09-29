@@ -44,9 +44,9 @@ public sealed class ChatSettings
     public bool SaveConversations { get; set; } = true;
     public bool DeveloperMode { get; set; } = true;
     /// <summary>Previous messages included as context for follow-up questions.</summary>
-    public int HistoryMessages { get; set; } = 6;
-    /// <summary>Minutes an unanswered clarification question stays open (then the customer is asked for the full request).</summary>
-    public int ClarificationMinutes { get; set; } = 30;
+    public int HistoryMessages { get; set; } = 10;
+    /// <summary>Minutes an unanswered clarification question stays open (then the customer is asked for the full request). Default 4 hours: a reply after a meeting or a phone call still continues the request.</summary>
+    public int ClarificationMinutes { get; set; } = 240;
     /// <summary>Follow-up questions for one request before AYAAN asks for the complete request in one message.</summary>
     public int MaxClarificationSteps { get; set; } = 4;
     /// <summary>Characters of earlier turns sent to the model (oldest turns are dropped first; the open request never is).</summary>

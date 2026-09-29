@@ -193,6 +193,14 @@ public sealed class ConversationsController : ControllerBase
         return Ok(detail);
     }
 
+    /// <summary>
+    /// Active intent and open clarification question of the conversation (restores option buttons after a reload).
+    /// Owner-scoped: tenant, user and customer database come from the validated token, never from the request.
+    /// </summary>
+    [HttpGet("{id}/context")]
+    public async Task<ActionResult<ConversationContextDto>> Context(string id, CancellationToken ct)
+        => Ok(await _service.GetContextAsync(id, ct));
+
     [HttpPatch("{id}")]
     public async Task<ActionResult<ConversationSummaryDto>> Update(string id, [FromBody] UpdateConversationRequest request, CancellationToken ct)
         => Ok(await _service.UpdateAsync(id, request, ct));

@@ -77,6 +77,44 @@ public sealed class ConversationService
         await _conversations.UpdateAsync(c, ct);
     }
 
+    /// <summary>
+    /// Conversation context for restoring the chat after a reload or reconnect: the active intent and the open question
+    /// (with its selectable choices). Owner-scoped (tenant + user + customer database from the token); another owner's
+    /// id is "not found". Never returns the stored request text, answers or internal ids.
+    /// </summary>
+    public async Task<ConversationContextDto> GetContextAsync(string id, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(id) || id.Length > 64) throw new NotFoundException("Conversation not found.");
+        var state = _states is null ? null : await _states.GetAsync(id, _user.CompanyId, _user.UserId, _user.DatabaseName, ct);
+        if (state is null)
+        {
+            // A saved conversation without state yet (no turn finished) has no open question.
+            await Load(id, ct);
+            return new ConversationContextDto { ConversationId = id };
+        }
+        var pending = state.Pending;
+        return new ConversationContextDto
+        {
+            ConversationId = id,
+            Intent = state.Intent,
+            Stage = state.Stage,
+            Pending = pending is null ? null : new PendingClarificationDto
+            {
+                Question = pending.Question,
+                Kind = pending.Kind,
+                Choices = pending.Options.Select((o, i) => new ClarificationChoiceDto
+                {
+                    DisplayText = o,
+                    Value = i < pending.OptionValues.Count ? pending.OptionValues[i] : o
+                }).ToList(),
+                Step = pending.Step,
+                MessageId = pending.AssistantMessageId,
+                FollowUp = pending.Soft,
+                AskedAt = pending.AskedAt
+            }
+        };
+    }
+
     private async Task<Conversation> Load(string id, CancellationToken ct)
     {
         var c = await _conversations.GetAsync(id, _user.UserId, _user.CompanyId, ct);
