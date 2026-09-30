@@ -52,6 +52,11 @@ public sealed class ChatRequest
     /// the visible label is never parsed. Only values the server offered for the open question are accepted.
     /// </summary>
     public ClarificationChoiceDto? Choice { get; set; }
+    /// <summary>
+    /// Id of a predefined (quick) question the user clicked ("stock_low"). The server accepts it only together with that
+    /// question's exact text, then uses the canonical intent instead of re-discovering it. Free text has no preset id.
+    /// </summary>
+    [StringLength(64)] public string? PresetId { get; set; }
 }
 
 /// <summary>One selectable answer of a clarification question.</summary>

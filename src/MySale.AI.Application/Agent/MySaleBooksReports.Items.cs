@@ -319,7 +319,7 @@ public sealed partial class MySaleBooksReports
             .Select(r =>
             {
                 var loc = Str(r["_id"]);
-                var label = loc is not null && locations.TryGetValue(loc, out var ln) ? ln : loc is null or "0" ? "No warehouse" : loc.Length > 6 ? "Warehouse …" + loc[^6..] : "Warehouse " + loc;
+                var label = locations.Label(loc);
                 return StockRow(label, Num(r["received"]) - Num(r["issued"]), unit);
             })
             .ToList();

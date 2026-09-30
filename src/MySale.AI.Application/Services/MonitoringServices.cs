@@ -226,7 +226,8 @@ public static class TestQuestionCatalog
             "What is my current inventory value?",
             "Show products with no sales in the last 30 days.",
             "Which product categories have the most stock?",
-            "What are my most profitable products this year?"
+            "Which products are out of stock?",
+            "Which products have not sold in the last 90 days?"
         }),
         new("Customers", "users", new()
         {

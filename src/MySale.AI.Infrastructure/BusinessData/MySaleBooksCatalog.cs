@@ -15,7 +15,7 @@ public static class MySaleBooksCatalog
     public static readonly IReadOnlySet<string> Names = new HashSet<string>(StringComparer.Ordinal)
     {
         "StockMaster", "AccountVoucher", "Item", "Ledger", "AccountGroup", "AccountType", "StockLocation", "Branch",
-        "Unit", "Category", "Currency", "Company", "BillWiseDetails", "Sale", "Purchase"
+        "Unit", "Category", "Currency", "Company", "BillWiseDetails", "Sale", "Purchase", "Employee", "Manufacture", "Department"
     };
 
     private static FieldSchema F(string name, string type, string description, string? relationship = null, string? example = null) => new()
@@ -116,6 +116,8 @@ public static class MySaleBooksCatalog
                 F("chequeDate", "date", "Cheque date (not the voucher date)"),
                 F("isCanceled", "bool", "Cancelled lines — always exclude (the only status the accounting reports filter on)."),
                 F("billWiseAdjustmentCategory", "string", "Advance | ExReference | NewReference | OnAccount"),
+                F("employeeId", "string", "Employee / salesman of the voucher (string of Employee._id)", "Employee._id"),
+                F("departmentId", "string", "Department of the voucher (string of Department._id)", "Department._id"),
                 F("isReconciled", "bool", "Bank reconciliation status"),
                 F("reconciledDate", "date", "Bank reconciliation date"),
                 Branch(),
@@ -147,6 +149,7 @@ public static class MySaleBooksCatalog
                 F("alternateUnits.taxIncAmount", "decimal", "Selling price of the alternate unit including tax"),
                 F("itemType", "string", "product | rawMaterial | service (stock reports use product and rawMaterial; services are not stock-tracked)"),
                 F("categoryId", "string", "Category (string of Category._id)", "Category._id"),
+                F("manufactureId", "string", "Brand / manufacturer (string of Manufacture._id; \"0\" = none)", "Manufacture._id"),
                 F("unitId", "string", "Stock unit of the product (StockMaster quantities are in this unit)", "Unit._id"),
                 F("costingType", "string", "Item costing type (default FIFO)"),
                 F("landingCost", "decimal", "Current landed cost per unit (base currency) — fallback cost when no FIFO layer exists"),
@@ -312,6 +315,7 @@ public static class MySaleBooksCatalog
                 F("dueDate", "date", "Due date"),
                 F("creditPeriod", "decimal", "Credit period in days"),
                 F("ledgerId", "string", "Customer ledger", "Ledger._id"),
+                F("employeeId", "string", "Salesman / employee of the invoice (string of Employee._id)", "Employee._id"),
                 F("netAmount", "decimal", "Invoice total (base currency)"),
                 F("receivedAmount", "decimal", "Amount received against the invoice"),
                 F("balanceAmount", "decimal", "Outstanding amount of the invoice"),
@@ -336,13 +340,60 @@ public static class MySaleBooksCatalog
                 F("purchaseNo", "string", "Purchase / bill number"),
                 F("purchaseDate", "date", "Purchase (business) date"),
                 F("dueDate", "date", "Due date"),
+                F("invoiceNo", "string", "Supplier's bill / invoice number"),
                 F("ledgerId", "string", "Supplier ledger", "Ledger._id"),
+                F("employeeId", "string", "Employee who entered the purchase (string of Employee._id)", "Employee._id"),
+                F("stockLocationId", "string", "Warehouse", "StockLocation._id"),
                 F("netValue", "decimal", "Purchase value posted to the purchase account"),
                 F("netAmount", "decimal", "Bill total"),
                 F("balanceAmount", "decimal", "Outstanding amount of the bill"),
                 F("isBillWise", "bool", "Bill-wise flag (pending bills have isBillWise false)"),
                 F("isCanceled", "bool", "Cancelled bill — always excluded"),
                 Branch(),
+                Company()
+            }
+        },
+        new CollectionSchema
+        {
+            Name = "Employee",
+            Description = "Employees — the salesmen of sales invoices (Sale.employeeId) and the employees of purchases / vouchers.",
+            Fields = new()
+            {
+                Id("Employee id (referenced as a string by Sale.employeeId, Purchase.employeeId, AccountVoucher.employeeId)"),
+                F("employeeName", "string", "Employee / salesman name"),
+                F("employeeLocalName", "string", "Name in the local language"),
+                F("employeeCode", "string", "Employee code"),
+                F("departmentId", "string", "Department", "Department._id"),
+                F("status", "bool", "Active flag"),
+                F("isCanceled", "bool", "Cancelled employee"),
+                Branch("\"0\" = shared"),
+                Company()
+            }
+        },
+        new CollectionSchema
+        {
+            Name = "Manufacture",
+            Description = "Brands / manufacturers of products (Item.manufactureId).",
+            Fields = new()
+            {
+                Id("Brand id (referenced as a string by Item.manufactureId)"),
+                F("manufactureName", "string", "Brand / manufacturer name"),
+                F("manufactureLocalName", "string", "Name in the local language"),
+                F("status", "bool", "Active flag"),
+                F("isCanceled", "bool", "Cancelled brand"),
+                Branch("\"0\" = shared"),
+                Company()
+            }
+        },
+        new CollectionSchema
+        {
+            Name = "Department",
+            Description = "Departments (Employee.departmentId, AccountVoucher.departmentId).",
+            Fields = new()
+            {
+                Id("Department id"),
+                F("departmentName", "string", "Department name"),
+                Branch("\"0\" = shared"),
                 Company()
             }
         },

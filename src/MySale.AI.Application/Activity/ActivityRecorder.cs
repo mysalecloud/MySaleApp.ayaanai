@@ -429,6 +429,14 @@ public sealed class ActivityRecorder
         AddStage("ReferenceResolution", "ok", durationMs, string.Join("; ", notes));
     });
 
+    /// <summary>References whose ids have no master record (orphans) or whose master could not be read — data-integrity review.</summary>
+    public void ReferenceIntegrity(IReadOnlyList<string> lines) => Safe(() =>
+        AddStage("DataIntegrity", "warning", 0, string.Join("; ", lines)));
+
+    /// <summary>The final display check removed raw ids from labels or the answer text (a mapping the resolver missed).</summary>
+    public void DisplayIdsRemoved(IReadOnlyList<string> issues) => Safe(() =>
+        AddStage("DisplayIdGuard", "warning", 0, string.Join("; ", issues)));
+
     /// <summary>Rows the answer is based on (database result, or a server-side table calculation).</summary>
     public void SetResult(List<JsonObject> rows, List<string> columns, bool truncated) => Safe(() =>
     {

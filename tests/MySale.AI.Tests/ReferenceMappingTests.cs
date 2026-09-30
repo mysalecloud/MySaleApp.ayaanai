@@ -72,9 +72,10 @@ public class ReferenceMappingTests
         var r = await _engine.ResolveReferencesAsync(Prepared("Sales"), executed, _schema, new AppSettings(), default);
 
         Assert.Equal("ABC Trading", r.Result.Rows[0]["customerName"]!.GetValue<string>());
-        Assert.Equal(Customer2, r.Result.Rows[1]["customerName"]!.GetValue<string>()); // shows the id, not a guess
-        Assert.Equal(Customer2, r.Result.Rows[1]["customerId"]!.GetValue<string>());
+        Assert.Equal("Unknown customer", r.Result.Rows[1]["customerName"]!.GetValue<string>()); // neither the raw id nor a guess
+        Assert.Equal(Customer2, r.Result.Rows[1]["customerId"]!.GetValue<string>());          // id kept internally
         Assert.Contains("1/2 resolved", r.Notes.Single());
+        Assert.Equal(1, r.Diagnostics.Single().Orphans);                                      // logged for data-integrity review
     }
 
     [Fact]
@@ -94,15 +95,18 @@ public class ReferenceMappingTests
     public async Task Unrelated_fields_are_not_guessed_from_a_partial_match()
     {
         // "refCode" has no relationship and no matching collection: a single coincidental hit in a master
-        // collection is not enough to name the column.
+        // collection is not enough to name the column — and the raw ids are not displayed either.
         var ids = new[] { "680aaa42566d7d2000000001", "680aaa42566d7d2000000002", "680aaa42566d7d2000000003" };
         Records(new() { ["Customers"] = new() { new JsonObject { ["_id"] = ids[0], ["CustomerName"] = "Someone" } } });
         var executed = Executed(ids.Select(id => new JsonObject { ["refCode"] = id, ["amount"] = 1.0 }).ToArray());
 
         var r = await _engine.ResolveReferencesAsync(Prepared("Sales"), executed, _schema, new AppSettings(), default);
 
-        Assert.False(r.Changed);
-        Assert.Equal(new[] { "refCode", "amount" }, r.Result.Columns);
+        Assert.True(r.Changed);
+        Assert.Equal(new[] { "amount" }, r.Result.Columns);                                   // id column hidden …
+        Assert.Equal(ids[0], r.Result.Rows[0]["refCode"]!.GetValue<string>());               // … but kept in the rows
+        Assert.DoesNotContain(r.Result.Rows, row => row.ContainsKey("refCodeName"));         // no invented name
+        Assert.True(r.Diagnostics.Single().Hidden);
     }
 
     [Fact]
@@ -125,5 +129,6 @@ public class ReferenceMappingTests
         var system = messages[0].Content;
         Assert.Contains("never invent or guess a name", system);
         Assert.Contains("customerId + customerName", system);
+        Assert.Contains("never write internal IDs", system);
     }
 }

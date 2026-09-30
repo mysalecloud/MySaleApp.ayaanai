@@ -75,6 +75,26 @@ public sealed class ChatController : ControllerBase
     }
 
     /// <summary>
+    /// Predefined (quick) questions with their ids, exact messages, categories and canonical intents — the catalogue the
+    /// clients' quick-question buttons use (send the id as <c>presetId</c> with the exact message). Used by the audit script.
+    /// </summary>
+    [HttpGet("presets")]
+    public ActionResult<IReadOnlyList<PresetQuestion>> Presets() => Ok(PresetQuestions.All);
+
+    /// <summary>
+    /// Entity-mapping diagnostics (ids → names) for data-integrity review: per verified MySaleBooks reference, how many
+    /// distinct ids the company database uses, how many resolve to a master record, and the orphans. Admin / tester only.
+    /// </summary>
+    [HttpGet("diagnostics/entity-references")]
+    public async Task<IActionResult> EntityReferences(CancellationToken ct)
+    {
+        if (TenantProblem() is { } problem) return problem;
+        var checks = await _orchestrator.EntityReferenceDiagnosticsAsync(ct);
+        if (checks is null) return StatusCode(403, new ProblemDetails { Status = 403, Title = "Not allowed", Detail = "Diagnostics are available to administrators and testers only." });
+        return Ok(checks);
+    }
+
+    /// <summary>
     /// Full pipeline: question → MQL → validation → MongoDB → answer.
     /// MySaleBooks users: Authorization: Bearer &lt;existing JWT&gt; → validated → "dbName" claim → customer database.
     /// </summary>

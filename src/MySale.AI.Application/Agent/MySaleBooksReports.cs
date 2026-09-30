@@ -26,6 +26,8 @@ public sealed class ReportOutcome
     public List<string>? OptionIds { get; init; }
     /// <summary>Clarify: report argument that the customer's answer fills ("item", "ledger") — the report then runs again directly.</summary>
     public string? AnswerArgument { get; init; }
+    /// <summary>References the report could not name (orphan ids / unreadable master) — logged for data-integrity review.</summary>
+    public List<string> Integrity { get; } = new();
 }
 
 /// <summary>
@@ -41,7 +43,7 @@ public sealed partial class MySaleBooksReports
     public MySaleBooksReports(QueryEngine engine) => _engine = engine;
 
     public static readonly IReadOnlySet<string> Supported = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        { "ledgerStatement", "stockMovement", ItemStockReport, ItemDetailsReport };
+        { "ledgerStatement", "stockMovement", ItemStockReport, ItemDetailsReport, StockSummaryReport };
 
     private sealed class Run
     {
@@ -49,6 +51,7 @@ public sealed partial class MySaleBooksReports
         public long Ms { get; set; }
         public bool StoreMissing { get; set; }
         public string? Error { get; set; }
+        public List<string> Integrity { get; } = new();
     }
 
     public async Task<ReportOutcome> RunAsync(MqlQuery plan, MqlValidationContext context, DateAnchors anchors, AppSettings settings,
@@ -65,33 +68,32 @@ public sealed partial class MySaleBooksReports
         var run = new Run();
         var outcome = report.ToLowerInvariant() switch
         {
-            "ledgerstatement" => await LedgerStatementAsync(Str(args["ledger"]), from, to, context, anchors, settings, decimals, run, ct, comment),
+            "ledgerstatement" => await LedgerStatementAsync(args, from, to, context, anchors, settings, decimals, run, ct, comment),
             "itemstock" => await ItemStockAsync(args, anchors, context, settings, decimals, currency, run, ct, comment),
             "itemdetails" => await ItemDetailsAsync(args, context, settings, decimals, currency, run, ct, comment),
+            "stocksummary" => await StockSummaryAsync(args, anchors, context, settings, decimals, currency, run, ct, comment),
             _ => await StockMovementAsync(Str(args["item"]), Str(args["itemId"]), from, to, context, anchors, settings, run, ct, comment)
         };
         if (run.StoreMissing) return new ReportOutcome { Kind = "blocked", StoreContextMissing = true, Queries = run.Queries };
         if (run.Error is not null) return new ReportOutcome { Kind = "blocked", Message = run.Error, Queries = run.Queries, ElapsedMs = run.Ms };
+        outcome.Integrity.AddRange(run.Integrity);
         return outcome;
     }
 
     // ------------------------------------------------------------------ ledger statement
 
-    private async Task<ReportOutcome> LedgerStatementAsync(string? ledgerText, DateOnly from, DateOnly to, MqlValidationContext context,
+    private async Task<ReportOutcome> LedgerStatementAsync(JsonObject args, DateOnly from, DateOnly to, MqlValidationContext context,
         DateAnchors anchors, AppSettings settings, int decimals, Run run, CancellationToken ct, string? comment)
     {
-        if (string.IsNullOrWhiteSpace(ledgerText))
+        var ledgerText = Str(args["ledger"]);
+        if (string.IsNullOrWhiteSpace(ledgerText) && Str(args["ledgerId"]) is null)
             return Clarify("Which ledger (customer, supplier, cash, bank or other account) should I show the statement for?", run, answerArgument: "ledger");
 
-        var ledgers = await FindAsync("Ledger", "ledgerName", ledgerText,
+        var pick = await PickEntityAsync("ledger", "ledger", args,
             new JsonObject { ["ledgerName"] = 1, ["groupName"] = 1, ["opBalanceDebit"] = 1, ["opBalanceCredit"] = 1 }, context, settings, run, ct, comment);
-        if (run.Error is not null || run.StoreMissing) return new ReportOutcome();
-        if (ledgers.Count == 0) return new ReportOutcome { Kind = "notfound", Message = $"I couldn't find a ledger named \"{ledgerText.Trim()}\".", Queries = run.Queries };
-        if (ledgers.Count > 1)
-            return Clarify($"Which ledger do you mean: {string.Join(", ", ledgers.Take(5).Select(l => Str(l["ledgerName"])))}?", run,
-                ledgers.Take(5).Select(l => Str(l["ledgerName"])).Where(n => n is not null).Select(n => n!).ToList(), "ledger");
-
-        var ledger = ledgers[0];
+        if (pick.Outcome is not null) return pick.Outcome;
+        var ledger = pick.Record!;
+        ledgerText ??= Str(ledger["ledgerName"]) ?? string.Empty;
         var ledgerId = Str(ledger["_id"])!;
         var ledgerName = Str(ledger["ledgerName"]) ?? ledgerText.Trim();
         var range = DateAnchors.ForLocalDays(from, to, anchors.BoundaryTimeZoneId);
@@ -299,7 +301,7 @@ public sealed partial class MySaleBooksReports
             balance += inQty - outQty;
             var loc = Str(m["stockLocationId"]);
             rows.Add(MovementRow(DateText(m["transactionDate"], anchors), Label(Str(m["transactionType"])),
-                loc is not null && locations.TryGetValue(loc, out var ln) ? ln : loc, Str(m["ledgerName"]), inQty, outQty, balance));
+                locations.Label(loc), Str(m["ledgerName"]), inQty, outQty, balance));
         }
         rows.Add(MovementRow(to.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture), "Closing stock", null, null, received, issued, closingQty));
 
@@ -329,6 +331,85 @@ public sealed partial class MySaleBooksReports
     };
 
     // ------------------------------------------------------------------ helpers
+
+    private sealed record EntityPick(JsonObject? Record, ReportOutcome? Outcome);
+
+    /// <summary>
+    /// The one record the user means (reverse resolution): the id chosen in an earlier clarification
+    /// (<c>{argument}Id</c>), else the name / code typed. One exact match is used; several records with the same or a
+    /// similar name are offered as choices (told apart by code or number, each with its verified id) — never picked
+    /// silently; none → "not found".
+    /// </summary>
+    private async Task<EntityPick> PickEntityAsync(string entityKey, string argument, JsonObject args, JsonObject projection, MqlValidationContext context,
+        AppSettings settings, Run run, CancellationToken ct, string? comment)
+    {
+        var entity = EntityCatalog.Types[entityKey];
+        var text = Str(args[argument]);
+        if (Str(args[argument + "Id"]) is { } chosenId && QueryEngine.IsObjectIdText(chosenId))
+        {
+            var byId = await AggregateAsync(entity.Collection!, new JsonArray
+            {
+                new JsonObject { ["$match"] = new JsonObject { ["_id"] = new JsonObject { ["$oid"] = chosenId.ToLowerInvariant() } } },
+                new JsonObject { ["$project"] = (JsonObject)projection.DeepClone() },
+                new JsonObject { ["$limit"] = 1 }
+            }, context, settings, run, ct, comment);
+            if (run.Error is not null || run.StoreMissing) return new EntityPick(null, new ReportOutcome());
+            if (byId.Rows.Count == 1) return new EntityPick(byId.Rows[0], null);
+        }
+        if (string.IsNullOrWhiteSpace(text))
+            return new EntityPick(null, new ReportOutcome { Kind = "notfound", Message = $"I couldn't find that {entity.Singular}.", Queries = run.Queries });
+
+        var found = await FindEntityAsync(entityKey, text, projection, context, settings, run, ct, comment);
+        if (run.Error is not null || run.StoreMissing) return new EntityPick(null, new ReportOutcome());
+        var shownText = CleanItemText(text);
+        if (found.Count == 0)
+            return new EntityPick(null, new ReportOutcome { Kind = "notfound", Message = $"I couldn't find a {entity.Singular} named “{shownText}”.", Queries = run.Queries });
+        var exact = found.Where(f => string.Equals(Str(f[entity.NameField!])?.Trim(), text.Trim(), StringComparison.OrdinalIgnoreCase)).ToList();
+        var candidates = exact.Count > 0 ? exact : found;
+        if (candidates.Count == 1) return new EntityPick(candidates[0], null);
+
+        var choices = candidates.Take(MaxChoices).ToList();
+        var labels = ChoiceLabels(choices, entity);
+        return new EntityPick(null, new ReportOutcome
+        {
+            Kind = "clarify",
+            Message = $"Several {entity.Plural} match “{shownText}”: {string.Join(", ", labels)}. Which one do you mean?",
+            Options = labels,
+            OptionIds = choices.Select(c => Str(c["_id"]) ?? string.Empty).ToList(),
+            AnswerArgument = argument,
+            Queries = run.Queries
+        });
+    }
+
+    /// <summary>Choice labels that tell records with the same name apart: "ABC Trading (SUP-01)", else "ABC Trading (2)".</summary>
+    private static List<string> ChoiceLabels(List<JsonObject> records, EntityType entity)
+    {
+        var names = records.Select(r => Str(r[entity.NameField!])?.Trim() ?? "?").ToList();
+        var labels = new List<string>();
+        for (var i = 0; i < records.Count; i++)
+        {
+            var same = names.Count(n => string.Equals(n, names[i], StringComparison.OrdinalIgnoreCase));
+            if (same == 1) { labels.Add(names[i]); continue; }
+            var code = entity.CodeFields.Select(c => Str(records[i][c])).FirstOrDefault(c => c is not null);
+            var index = names.Take(i + 1).Count(n => string.Equals(n, names[i], StringComparison.OrdinalIgnoreCase));
+            labels.Add(code is not null ? $"{names[i]} ({code})" : $"{names[i]} ({index})");
+        }
+        return labels;
+    }
+
+    /// <summary>
+    /// Name / code → record (reverse resolution) of a catalog entity: its verified master, name field and code fields
+    /// (<see cref="EntityCatalog"/>). Several matches are returned so the caller asks which one — never picks silently.
+    /// </summary>
+    private Task<List<JsonObject>> FindEntityAsync(string entityKey, string text, JsonObject projection, MqlValidationContext context, AppSettings settings,
+        Run run, CancellationToken ct, string? comment)
+    {
+        var entity = EntityCatalog.Types[entityKey];
+        var projected = (JsonObject)projection.DeepClone();
+        foreach (var code in entity.CodeFields) projected[code] = 1;
+        return FindAsync(entity.Collection!, entity.NameField!, text, projected, context, settings, run, ct, comment,
+            entity.CodeFields.Where(c => context.Collections.FirstOrDefault(x => x.Name == entity.Collection)?.Fields.Any(f => f.Name == c) == true).ToArray());
+    }
 
     /// <summary>Finds master records by exact name (case/space-insensitive), then by code, then by partial name.</summary>
     private async Task<List<JsonObject>> FindAsync(string collection, string nameField, string text, JsonObject projection,
@@ -372,20 +453,23 @@ public sealed partial class MySaleBooksReports
         return Str(r.Rows.FirstOrDefault()?["unitName"]);
     }
 
-    private async Task<Dictionary<string, string>> LocationNamesAsync(List<string> ids, MqlValidationContext context, AppSettings settings, Run run,
+    private Task<EntityNames> LocationNamesAsync(List<string> ids, MqlValidationContext context, AppSettings settings, Run run,
+        CancellationToken ct, string? comment)
+        => EntityNamesAsync("warehouse", ids, context, settings, run, ct, comment);
+
+    /// <summary>
+    /// Names of entity ids through the central resolver (<see cref="EntityCatalog"/>): the verified master and name field,
+    /// "No …" for empty / "0", "Unknown …" for ids without a record. Orphans are noted for the data-integrity log.
+    /// </summary>
+    private async Task<EntityNames> EntityNamesAsync(string entity, IEnumerable<string?> ids, MqlValidationContext context, AppSettings settings, Run run,
         CancellationToken ct, string? comment)
     {
-        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        var valid = ids.Where(i => Regex.IsMatch(i, "^[0-9a-fA-F]{24}$")).Take(50).ToList();
-        if (valid.Count == 0 || !context.Collections.Any(c => c.Name == "StockLocation")) return map;
-        var r = await AggregateAsync("StockLocation", new JsonArray
-        {
-            new JsonObject { ["$match"] = new JsonObject { ["_id"] = new JsonObject { ["$in"] = new JsonArray(valid.Select(i => (JsonNode)new JsonObject { ["$oid"] = i.ToLowerInvariant() }).ToArray()) } } },
-            new JsonObject { ["$project"] = new JsonObject { ["stockLocationName"] = 1 } }
-        }, context, settings, run, ct, comment, optional: true);
-        foreach (var row in r.Rows)
-            if (Str(row["_id"]) is { } id && Str(row["stockLocationName"]) is { } name) map[id] = name;
-        return map;
+        var names = await _engine.ResolveEntityNamesAsync(entity, ids, context.Collections, settings, ct, comment);
+        if (names.Orphans.Count > 0)
+            run.Integrity.Add($"{entity}: {names.Orphans.Count} id(s) without a master record [{string.Join(", ", names.Orphans.Take(10))}]");
+        if (names.Failed)
+            run.Integrity.Add($"{entity}: master could not be read");
+        return names;
     }
 
     /// <summary>Runs a server-built pipeline through the normal validation, tenant scope, store filter and status filter.</summary>

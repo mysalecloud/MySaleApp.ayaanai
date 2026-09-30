@@ -47,7 +47,7 @@ public sealed class PromptBuilder
     /// Prompt template version, recorded with every AI activity. Bump it whenever the query / answer prompts change,
     /// so answers can be compared across prompt revisions.
     /// </summary>
-    public const string Version = "ayaan-prompts-2026.09.10"; // .2 ids; .3 tolerant text; .4 store; .5 dates/customers/zero; .6 business terms; .7 MySaleBooks rules/currency/wall-clock dates; .8 conversation memory/clarifications; .9 item stock/details reports; .10 conversation state (intent, parameters, shown answers)
+    public const string Version = "ayaan-prompts-2026.09.29"; // .2 ids; .3 tolerant text; .4 store; .5 dates/customers/zero; .6 business terms; .7 MySaleBooks rules/currency/wall-clock dates; .8 conversation memory/clarifications; .9 item stock/details reports; .10 conversation state (intent, parameters, shown answers); .11 stock engine + canonical stock intents + preset interpretations; .29 entity names (ids never shown)
 
     // ------------------------------------------------------------------ step 1: question -> MQL
 
@@ -523,8 +523,8 @@ public sealed class PromptBuilder
             : $"- The company currency is not configured ({ctx.CurrencyMissing}): write amounts like \"{sampleMoney}\" without a currency code and say once that the currency is not configured.");
         system.AppendLine("- Be concise: start with a one or two sentence direct answer. Add a short markdown bullet list only when it helps (max 10 items); the app already shows the full table/chart.");
         system.AppendLine("- Do not mention MongoDB, queries, pipelines, JSON, collections or field names.");
-        system.AppendLine("- Rows may contain both an id and its mapped name (customerId + customerName, productId + productName, branchId + branchName …). Always refer to customers, products, branches, salespeople, suppliers, invoices, categories and warehouses by their name or number. Do not show internal IDs (24-character codes such as 68b3758… or GUIDs) when a name is available.");
-        system.AppendLine("- If a record has only an id and no name, you may say the name is not available (optionally with the id); never invent or guess a name for an id.");
+        system.AppendLine("- Records are identified by the names and numbers in the result (supplierName, customerName, itemName, warehouseName, invoiceNo …); internal ids (customerId + customerName pairs) were replaced by the server. Always refer to customers, products, branches, salespeople, suppliers, invoices, categories and warehouses by that name or number, and never write internal IDs (24-character codes such as 68b3758… or GUIDs).");
+        system.AppendLine("- \"Unknown supplier\" / \"Unknown product\" (…) means the record no longer exists in the master data and \"No warehouse\" (…) means none was set: say that plainly; never invent or guess a name for a record.");
         system.AppendLine("- If the result was truncated, mention that only the first records are shown.");
         system.AppendLine("- Do not end with a question and do not offer options: if the data could be read in more than one way (for example ledger balance vs unpaid invoices), say which one you used. The app offers follow-up choices itself.");
         // Example uses the verified currency / precision (never a hard-coded currency: it would leak into answers without one).

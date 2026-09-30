@@ -279,7 +279,8 @@ public class OrchestratorTests
         h.Provider.Answer = req =>
         {
             var data = req.Messages[^1].Content;
-            Assert.Contains("Al Noor Trading", data); // the model gets the name (the id is kept next to it)
+            Assert.Contains("Al Noor Trading", data); // the model gets the name …
+            Assert.DoesNotContain(id1, data);         // … never the internal id (kept in the rows for follow-ups)
             return "Al Noor Trading leads with AED 64,488.86.";
         };
 

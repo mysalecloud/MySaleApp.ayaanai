@@ -188,6 +188,20 @@ public sealed class AIAgentOrchestrator
         _logger = logger;
     }
 
+    /// <summary>
+    /// Data-integrity diagnostics of the entity mappings (ids → names) over the caller's company database: per verified
+    /// reference, ids checked / resolved / unresolved / orphaned. Admins and testers only (same rule as technical
+    /// details); null = not allowed. Read-only; ids only, never business amounts.
+    /// </summary>
+    public async Task<List<EntityReferenceCheck>?> EntityReferenceDiagnosticsAsync(CancellationToken ct)
+    {
+        if (!TechnicalDetailsPolicy.CanSeeTechnicalDetails(_user, _activity?.Options.AllowMySaleBooksAdmins ?? false)) return null;
+        var settings = await _settings.GetAsync(ct);
+        var schema = await _engine.GetAllowedSchemaAsync(settings, ct);
+        if (!EntityCatalog.Applies(schema)) return new List<EntityReferenceCheck>();
+        return await _engine.CheckEntityReferencesAsync(schema, settings, ct);
+    }
+
     public async Task<ChatResponse> RunAsync(ChatRequest request, IChatEventSink sink, CancellationToken ct)
     {
         // Activity tracking: every request leaves an audit record. Tracking never changes or breaks the answer.
@@ -313,6 +327,10 @@ public sealed class AIAgentOrchestrator
         var conversationNotes = new List<string>();
         IReadOnlyList<CollectionSchema> knownSchema = Array.Empty<CollectionSchema>();
         var earlyAnchors = DateAnchors.Compute(now, _user.TimeZone, _calendar.FinancialYearStartMonth, _calendar.IsWallClock(_user.IsMySaleBooksUser));
+        // Predefined question: accepted only with its own catalogue text; it is always a new request with a known intent.
+        var preset = PresetQuestions.Resolve(request.PresetId, question);
+        if (preset is null && !string.IsNullOrWhiteSpace(request.PresetId))
+            conversationNotes.Add($"Unknown preset id or text changed ({ClarificationFlow.Short(request.PresetId, 40)}) — treated as a typed question.");
         // Clicked option: its structured value decides (the visible label is never parsed).
         var choice = request.Choice is { Value.Length: > 0 } clicked ? new StructuredChoice(clicked.Value.Trim(), clicked.DisplayText) : null;
         // Clarification state machine of this turn (recorded in the trace, the activity log and the conversation state).
@@ -332,7 +350,7 @@ public sealed class AIAgentOrchestrator
             var previousValue = pending.Parameter is { } previousParameter && state.PreviousParameters.TryGetValue(previousParameter, out var pv) ? pv : null;
             var interpretation = isDateQuestion ? null : ReplyInterpreter.Interpret(rawQuestion, pending, choice, previousValue);
             var choseOption = interpretation is { Outcome: ReplyOutcome.Resolved, Value: not null };
-            var kind = choseOption ? ReplyKind.Answer : ClarificationFlow.Classify(rawQuestion, pending);
+            var kind = preset is not null ? ReplyKind.NewTopic : choseOption ? ReplyKind.Answer : ClarificationFlow.Classify(rawQuestion, pending);
             // A follow-up offer at the end of an answer is answered only by a short contextual reply ("yes", "ledger",
             // "the second one"); any other message is a new request and the offer is dropped.
             if (pending.Soft && kind == ReplyKind.Answer && !choseOption && !ReplyInterpreter.IsContextual(rawQuestion))
@@ -510,7 +528,8 @@ public sealed class AIAgentOrchestrator
             ? activePending.Intent ?? ConversationIntents.Detect(activePending.OriginalQuestion) ?? state.Intent
             : newPending is not null && earlyReply is not null
                 ? newPending.Intent ?? state.Intent
-                : ConversationIntents.Detect(rawQuestion) ?? state.Intent;
+                : preset?.Intent ?? ConversationIntents.Detect(rawQuestion) ?? state.Intent;
+        if (preset is not null) conversationNotes.Add($"Predefined question “{preset.Label}” ({preset.Id}) → {preset.Intent}.");
         if (activePending is null && earlyReply is null)
         {
             // A new request starts with no collected parameters (the previous request's stay available for "same").
@@ -589,6 +608,8 @@ public sealed class AIAgentOrchestrator
         StoreScope? storeScope = null;
         QuestionDates questionDates = new();
         PreparedQuery? lastPrepared = null;
+        // id (lower case) → label shown instead ("ABC Trading", "Unknown supplier") — used by the final raw-id check of the answer.
+        Dictionary<string, string>? idLabels = null;
         SemanticInterpretation semantics = new();
         // Configured currency only for databases without MySaleBooks company settings; replaced by the verified company currency.
         string? currencyCode = string.IsNullOrWhiteSpace(_user.Currency) ? null : _user.Currency;
@@ -759,6 +780,22 @@ public sealed class AIAgentOrchestrator
             }
 
             // 4-6. Generate → validate → (repair) → scope
+            // Whole-inventory stock questions (typed or predefined) → canonical stock intent → the server stock engine.
+            // Every wording of the same intent runs the same calculation; the model never writes these queries.
+            if (forcedPlan is null && domainActive && _reports is not null && !attachmentContext.Any
+                && StockIntents.Route(question, anchors, questionDates) is { } stockIntent)
+            {
+                forcedPlan = stockIntent.Plan;
+                currentIntent = stockIntent.Intent;
+                state.Intent = stockIntent.Intent;
+                trace.Add("canonicalIntent", "Canonical intent", $"{stockIntent.Intent} ← {stockIntent.Reason} → stockSummary / {stockIntent.View}\n{stockIntent.Plan.Arguments?.ToJsonString()}", "ok");
+                activity.ConversationContext($"Canonical intent {stockIntent.Intent} (stock engine, view {stockIntent.View}).");
+            }
+            else if (preset is { Route: "stock" })
+                trace.Add("canonicalIntent", "Canonical intent", $"Predefined stock question {preset.Id} did not resolve to a stock intent (MySaleBooks stock data not available?)", "warning");
+            // Predefined planner questions carry their fixed interpretation, so the model does not re-guess or re-ask it.
+            if (forcedPlan is null && preset?.Hint is { Length: > 0 } presetHint)
+                plannerQuestion = plannerQuestion.TrimEnd() + "\n\nPredefined question " + preset.Intent + " — use exactly this interpretation: " + presetHint;
             flow.Add(ConversationStages.ParametersChecked);
             var messages = _prompts.BuildQueryMessages(promptContext, schema, history, plannerQuestion,
                 attachmentContext.Any ? attachmentContext.BuildPromptSection() : null, settings.Chat.HistoryCharBudget,
@@ -787,7 +824,7 @@ public sealed class AIAgentOrchestrator
                 if (forcedPlan is not null)
                 {
                     query = forcedPlan;
-                    trace.Add("forcedPlan", "Report re-run with the customer's choice", forcedPlan.Arguments?.ToJsonString() ?? string.Empty, "ok");
+                    trace.Add("forcedPlan", "Server report plan (no model call)", forcedPlan.Arguments?.ToJsonString() ?? string.Empty, "ok");
                     break;
                 }
                 await sink.OnStatusAsync(attempt == 0 ? "generating_query" : "repairing",
@@ -899,7 +936,8 @@ public sealed class AIAgentOrchestrator
                         trace.Add("tableQuery", "Table calculation (server-side)", assistant.Mql, "ok");
                         await sink.OnQueryAsync(QueryInfoFor(assistant), token);
                         var (rows, columns) = ResultShaper.Shape(tableResult!.Rows);
-                        return await AnswerFromRowsAsync(rows, columns, false, attachmentPlan.Explanation + $" (from {target.FileName}, {tableResult.MatchedRows} matching rows)", attachmentPlan.Visualization, 0);
+                        return await AnswerFromRowsAsync(rows, columns, false, attachmentPlan.Explanation + $" (from {target.FileName}, {tableResult.MatchedRows} matching rows)", attachmentPlan.Visualization, 0,
+                            businessData: false);
                     }
 
                     case "combined":
@@ -934,6 +972,12 @@ public sealed class AIAgentOrchestrator
                 trace.Add("report", "MySaleBooks report", $"{query.Arguments?["report"]} → {outcome.Kind}\n{assistant.Mql}", outcome.Kind == "ok" ? "ok" : "warning", outcome.ElapsedMs);
                 if (outcome.StoreContextMissing)
                     return await FinishAsync(ChatStatus.Unsupported, StoreScope.MissingMessage, "Store context missing (report)");
+                if (outcome.Integrity.Count > 0)
+                {
+                    _logger.LogWarning("AYAAN data integrity: unresolved references in a report: {References}", string.Join("; ", outcome.Integrity));
+                    trace.Add("dataIntegrity", "Unresolved references (data integrity)", string.Join("\n", outcome.Integrity), "warning");
+                    activity.ReferenceIntegrity(outcome.Integrity);
+                }
                 switch (outcome.Kind)
                 {
                     case "clarify":
@@ -1143,8 +1187,19 @@ public sealed class AIAgentOrchestrator
             if (references.Changed)
             {
                 executed = references.Result;
+                idLabels = references.Labels;
                 trace.Add("references", "IDs → names", string.Join("\n", references.Notes), "ok", references.ElapsedMs);
                 activity.ReferencesResolved(references.Notes, references.ElapsedMs);
+                // Orphans (ids with no master record) and unreadable masters are logged separately for data-integrity review.
+                var integrity = references.Diagnostics.Where(d => d.Orphans > 0 || d.LookupFailed).ToList();
+                if (integrity.Count > 0)
+                {
+                    var lines = integrity.Select(d => $"{d.Source ?? d.Column} → {d.Entity}: " +
+                        (d.Orphans > 0 ? $"{d.Orphans} orphan id(s) [{string.Join(", ", d.OrphanIds)}]" : "master could not be read")).ToList();
+                    _logger.LogWarning("AYAAN data integrity: unresolved references in a result: {References}", string.Join("; ", lines));
+                    trace.Add("dataIntegrity", "Unresolved references (data integrity)", string.Join("\n", lines), "warning");
+                    activity.ReferenceIntegrity(lines);
+                }
             }
             return await AnswerFromRowsAsync(executed.Rows, executed.Columns, executed.Truncated, query?.Explanation, query?.Visualization, executed.ElapsedMs);
         }
@@ -1198,8 +1253,23 @@ public sealed class AIAgentOrchestrator
 
         // ------------------------------------------------------------------ local: rows → answer (database, table and combined)
 
-        async Task<ChatResponse> AnswerFromRowsAsync(List<JsonObject> rows, List<string> columns, bool truncated, string? explanation, string? vizHint, long elapsedMs)
+        async Task<ChatResponse> AnswerFromRowsAsync(List<JsonObject> rows, List<string> columns, bool truncated, string? explanation, string? vizHint, long elapsedMs,
+            bool businessData = true)
         {
+            // Final safeguard: no raw ObjectId / GUID as a table, chart, KPI or ranking label (the user's own files are left as they are).
+            if (businessData && rows.Count > 0)
+            {
+                var display = DisplayIdGuard.Check(rows, columns, idLabels);
+                if (display.Issues.Count > 0)
+                {
+                    rows = display.Rows;
+                    columns = display.Columns;
+                    _logger.LogWarning("AYAAN missed id mapping in a result: {Issues}", string.Join("; ", display.Issues));
+                    trace.Add("displayGuard", "Raw id check (missed mapping)", string.Join("\n", display.Issues), "warning");
+                    activity.DisplayIdsRemoved(display.Issues);
+                }
+            }
+
             // Zero rows from a valid query: a clear sentence (topic + period), and for totals the real zero row
             // ("Today's sales are AED 0.00") — never an empty answer. Averages stay null (not available), not 0.
             ZeroResult? zero = null;
@@ -1238,9 +1308,11 @@ public sealed class AIAgentOrchestrator
             assistant.VisualizationJson = JsonSerializer.Serialize(visualization, MessageMapper.Web);
 
             await sink.OnStatusAsync("answering", "Writing the answer…", token);
-            var answerMessages = _prompts.BuildAnswerMessages(promptContext, question, explanation, rows, truncated, settings.Query.MaxRowsForAnswer);
+            // The answer model sees the displayed columns only (names, numbers, dates) — never the internal ids.
+            var answerRows = businessData ? DisplayIdGuard.ForAnswer(rows, columns) : rows;
+            var answerMessages = _prompts.BuildAnswerMessages(promptContext, question, explanation, answerRows, truncated, settings.Query.MaxRowsForAnswer);
             trace.Add("answerPrompt", "Final AI prompt", PromptBuilder.Render(answerMessages));
-            return await GenerateAndFinishAsync(answerMessages, rows);
+            return await GenerateAndFinishAsync(answerMessages, rows, businessData);
         }
 
         // ------------------------------------------------------------------ local: answer from files (documents / images / table preview)
@@ -1289,7 +1361,7 @@ public sealed class AIAgentOrchestrator
             return await GenerateAndFinishAsync(answerMessages, null);
         }
 
-        async Task<ChatResponse> GenerateAndFinishAsync(List<AIChatMessage> answerMessages, List<JsonObject>? groundingRows)
+        async Task<ChatResponse> GenerateAndFinishAsync(List<AIChatMessage> answerMessages, List<JsonObject>? groundingRows, bool businessData = false)
         {
             string answer;
             stage = ActivityStages.ResponseGeneration;
@@ -1316,6 +1388,19 @@ public sealed class AIAgentOrchestrator
             if (string.IsNullOrWhiteSpace(answer))
                 answer = UserMessages.AnswerFailed;
 
+            // Raw ids in the answer text: named ids become their name, others "(not available)" — logged as a missed mapping.
+            if (businessData)
+            {
+                var (cleanAnswer, replacedIds) = DisplayIdGuard.CleanText(answer, idLabels);
+                if (replacedIds > 0)
+                {
+                    answer = cleanAnswer;
+                    _logger.LogWarning("AYAAN answer contained {Count} raw id(s); replaced before sending", replacedIds);
+                    trace.Add("displayGuard", "Raw ids removed from the answer", $"{replacedIds} id(s) replaced by names / \"(not available)\".", "warning");
+                    activity.DisplayIdsRemoved(new[] { $"answer text: {replacedIds} raw id(s) replaced" });
+                }
+            }
+
             if (groundingRows is not null)
             {
                 var grounding = GroundingChecker.Check(answer, groundingRows, question);
@@ -1337,6 +1422,28 @@ public sealed class AIAgentOrchestrator
 
         async Task<ChatResponse> FinishReportAnswerAsync(ReportOutcome outcome, string answer)
         {
+            if (outcome.Rows.Count > 0)
+            {
+                var display = DisplayIdGuard.Check(outcome.Rows, outcome.Columns, idLabels);
+                if (display.Issues.Count > 0)
+                {
+                    outcome = new ReportOutcome
+                    {
+                        Kind = outcome.Kind, Message = outcome.Message, Rows = display.Rows, Columns = display.Columns, Explanation = outcome.Explanation,
+                        Truncated = outcome.Truncated, Queries = outcome.Queries, ElapsedMs = outcome.ElapsedMs
+                    };
+                    _logger.LogWarning("AYAAN missed id mapping in a report: {Issues}", string.Join("; ", display.Issues));
+                    trace.Add("displayGuard", "Raw id check (missed mapping)", string.Join("\n", display.Issues), "warning");
+                    activity.DisplayIdsRemoved(display.Issues);
+                }
+            }
+            var (cleanReport, reportIds) = DisplayIdGuard.CleanText(answer, idLabels);
+            if (reportIds > 0)
+            {
+                answer = cleanReport;
+                _logger.LogWarning("AYAAN report sentence contained {Count} raw id(s); replaced before sending", reportIds);
+                trace.Add("displayGuard", "Raw ids removed from the report sentence", $"{reportIds} id(s) replaced.", "warning");
+            }
             assistant.ExecutionTimeMs = log.ExecutionTimeMs = outcome.ElapsedMs;
             assistant.ResultCount = log.ResultCount = outcome.Rows.Count;
             assistant.Truncated = outcome.Truncated;

@@ -483,11 +483,20 @@ public class MySaleBooksOrchestratorTests
     [Fact]
     public async Task Valuation_questions_explain_what_is_missing()
     {
+        // Historical stock VALUE is not recalculated: the stock engine says so and gives the quantities on that day
+        // (no model call). Other valuation questions (COGS, profit) are still declined by the model rule.
         var h = WithMySaleBooks();
-        h.Provider.QueryResponses.Enqueue(_ => """{"type":"unsupported","reason":"valuation"}""");
         var r = await h.Orchestrator.RunAsync(new ChatRequest { Message = "What was my stock value on 1 January?" }, NullChatEventSink.Instance, default);
-        Assert.Equal(ChatStatus.Unsupported, r.Status);
+        Assert.Equal(ChatStatus.Success, r.Status);
         Assert.Contains("costing method", r.Answer);
+        Assert.Contains("not recalculated", r.Answer);
+        Assert.Empty(h.Provider.Requests);
+
+        var h2 = WithMySaleBooks();
+        h2.Provider.QueryResponses.Enqueue(_ => """{"type":"unsupported","reason":"valuation"}""");
+        var r2 = await h2.Orchestrator.RunAsync(new ChatRequest { Message = "What was my cost of goods sold last year?" }, NullChatEventSink.Instance, default);
+        Assert.Equal(ChatStatus.Unsupported, r2.Status);
+        Assert.Contains("costing method", r2.Answer);
     }
 
     [Fact]
