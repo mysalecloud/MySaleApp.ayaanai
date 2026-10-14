@@ -301,7 +301,8 @@ public sealed class OpenAIProvider : IAIProvider
         {
             var body = await response.Content.ReadAsStringAsync(ct);
             var node = JsonNode.Parse(body);
-            detail = node?["error"]?["message"]?.ToString() ?? node?["error"]?.ToString() ?? node?[0]?["error"]?["message"]?.ToString();
+            detail = node?["error"]?["message"]?.ToString() ?? node?["error"]?.ToString() ?? node?[0]?["error"]?["message"]?.ToString()
+                     ?? node?["detail"]?.ToString(); // NVIDIA / problem+json style: {"status":410,"title":"Gone","detail":"…"}
         }
         catch (Exception) { /* ignore body parsing errors */ }
 
@@ -310,6 +311,7 @@ public sealed class OpenAIProvider : IAIProvider
             HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden => $"{_config.Name}: authentication failed — check the API key.",
             HttpStatusCode.TooManyRequests => $"{_config.Name}: rate limit or quota exceeded.",
             HttpStatusCode.NotFound => $"{_config.Name}: HTTP 404 (check the base URL and model name).",
+            HttpStatusCode.Gone => $"{_config.Name}: HTTP 410 — this model is no longer available from the provider. Choose another model.",
             _ => $"{_config.Name}: HTTP {(int)response.StatusCode}."
         };
         return string.IsNullOrWhiteSpace(detail) ? prefix : $"{prefix} {Trim(detail, 300)}";

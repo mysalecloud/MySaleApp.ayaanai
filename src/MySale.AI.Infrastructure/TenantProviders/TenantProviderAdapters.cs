@@ -170,12 +170,40 @@ public sealed class TenantOpenAICompatibleProvider : IAIProvider
         if (_connection.Descriptor.SupportsModelListing)
         {
             var (status, models, error) = await ListAsync(ct);
-            if (models is not null)
+            if (models is not null && string.IsNullOrWhiteSpace(_connection.Model))
                 return new ProviderTestResult
                 {
                     Success = true, LatencyMs = sw.ElapsedMilliseconds, ModelCount = models.Count,
                     Message = $"Connected to {_connection.DisplayName}. {models.Count} model(s) available."
                 };
+            if (models is not null)
+            {
+                // The key works; also check that the chosen model really answers (a listed model may not be
+                // available to this account — chat would then fail although the key is fine).
+                try
+                {
+                    await _inner.GenerateResponseAsync(new AIChatRequest
+                    {
+                        Messages = new[] { AIChatMessage.User("Reply with OK.") },
+                        Model = _connection.Model,
+                        MaxTokens = 16,
+                        Temperature = 0
+                    }, ct);
+                    return new ProviderTestResult
+                    {
+                        Success = true, LatencyMs = sw.ElapsedMilliseconds, ModelCount = models.Count,
+                        Message = $"Connected to {_connection.DisplayName}. {models.Count} model(s) available; {_connection.Model} responded."
+                    };
+                }
+                catch (AIProviderException ex)
+                {
+                    return new ProviderTestResult
+                    {
+                        Success = false, LatencyMs = sw.ElapsedMilliseconds, ModelCount = models.Count,
+                        Message = $"The API key works, but model {_connection.Model} did not answer: {ex.Message}"
+                    };
+                }
+            }
             // Endpoints without a model list: confirm with a minimal completion instead.
             if (status is not (HttpStatusCode.NotFound or HttpStatusCode.MethodNotAllowed or HttpStatusCode.NotImplemented))
                 return new ProviderTestResult { Success = false, LatencyMs = sw.ElapsedMilliseconds, Message = error ?? $"{_connection.DisplayName}: connection failed." };
@@ -308,6 +336,7 @@ internal static class TenantHttpErrors
             HttpStatusCode.TooManyRequests => $"{name}: rate limit or quota exceeded. Try again later or check your plan.",
             HttpStatusCode.NotFound => $"{name}: not found (HTTP 404) — check the endpoint and model name.",
             HttpStatusCode.PaymentRequired => $"{name}: billing problem (HTTP 402) — check your account balance.",
+            HttpStatusCode.Gone => $"{name}: HTTP 410 — this model is no longer available from the provider. Choose another model.",
             >= HttpStatusCode.InternalServerError => $"{name}: the service is unavailable (HTTP {(int)response.StatusCode}). Try again later.",
             _ => $"{name}: HTTP {(int)response.StatusCode}."
         };
