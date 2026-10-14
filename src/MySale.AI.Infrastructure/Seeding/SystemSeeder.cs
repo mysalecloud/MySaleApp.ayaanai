@@ -120,6 +120,20 @@ public sealed class SystemSeeder
         OutputCostPer1M = 1.10m
     };
 
+    /// <summary>NVIDIA API (build.nvidia.com, OpenAI-compatible). Key: AiProviders:Overrides:NVIDIA:ApiKey or the AI Providers page.</summary>
+    private static ProviderConfig NvidiaProvider() => new()
+    {
+        Name = "NVIDIA",
+        Kind = "openai-compatible",
+        Category = ProviderCategory.Cloud,
+        BaseUrl = "https://integrate.api.nvidia.com/v1",
+        DefaultModel = "meta/llama-3.3-70b-instruct",
+        Temperature = 0.1,
+        MaxTokens = 1500,
+        TimeoutSeconds = 120,
+        Enabled = false
+    };
+
     private async Task SeedProvidersAsync(CancellationToken ct)
     {
         if (await _db.Providers.CountDocumentsAsync(FilterDefinition<ProviderConfig>.Empty, cancellationToken: ct) > 0)
@@ -127,6 +141,8 @@ public sealed class SystemSeeder
             // Existing installs: add providers introduced later, once.
             if (!await _db.Providers.Find(p => p.Name == "DeepSeek").AnyAsync(ct))
                 await _db.Providers.InsertOneAsync(DeepSeekProvider(), cancellationToken: ct);
+            if (!await _db.Providers.Find(p => p.Name == "NVIDIA").AnyAsync(ct))
+                await _db.Providers.InsertOneAsync(NvidiaProvider(), cancellationToken: ct);
             return;
         }
 
@@ -195,7 +211,8 @@ public sealed class SystemSeeder
                 InputCostPer1M = 3m,
                 OutputCostPer1M = 15m
             },
-            DeepSeekProvider()
+            DeepSeekProvider(),
+            NvidiaProvider()
         };
         await _db.Providers.InsertManyAsync(providers, cancellationToken: ct);
     }

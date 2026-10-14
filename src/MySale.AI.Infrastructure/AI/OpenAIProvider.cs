@@ -278,6 +278,15 @@ public sealed class OpenAIProvider : IAIProvider
 
         if (!response.IsSuccessStatusCode)
         {
+            // Some OpenAI-compatible endpoints / models (e.g. some NVIDIA NIM models) reject JSON mode: retry once
+            // without response_format — the prompt still asks for JSON only.
+            if (response.StatusCode is HttpStatusCode.BadRequest or HttpStatusCode.UnprocessableEntity && body.ContainsKey("response_format"))
+            {
+                response.Dispose();
+                var retry = (JsonObject)body.DeepClone();
+                retry.Remove("response_format");
+                return await SendAsync(retry, completion, ct);
+            }
             var error = await DescribeError(response, ct);
             response.Dispose();
             throw new AIProviderException(error);

@@ -324,7 +324,14 @@ public class PresetQuestionTests
     public void Ids_and_messages_are_unique()
     {
         Assert.Equal(PresetQuestions.All.Count, PresetQuestions.All.Select(p => p.Id).Distinct().Count());
-        Assert.Equal(PresetQuestions.All.Count, PresetQuestions.All.Select(p => p.Message.ToLowerInvariant()).Distinct().Count());
+        // A "featured" chip may repeat a grouped question word for word (same text in the widget); it must then mean the same thing.
+        var grouped = PresetQuestions.All.Where(p => !p.Id.StartsWith("featured_", StringComparison.Ordinal)).ToList();
+        var featured = PresetQuestions.All.Where(p => p.Id.StartsWith("featured_", StringComparison.Ordinal)).ToList();
+        Assert.Equal(grouped.Count, grouped.Select(p => p.Message.ToLowerInvariant()).Distinct().Count());
+        Assert.Equal(featured.Count, featured.Select(p => p.Message.ToLowerInvariant()).Distinct().Count());
+        foreach (var f in featured)
+            if (grouped.FirstOrDefault(g => string.Equals(g.Message, f.Message, StringComparison.OrdinalIgnoreCase)) is { } same)
+                Assert.Equal(same.Intent, f.Intent);
     }
 
     [Fact]

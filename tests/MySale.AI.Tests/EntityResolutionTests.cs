@@ -82,7 +82,7 @@ public class EntityResolutionTests
     {
         var r = await Resolve("Purchase",
             """[{"$group":{"_id":"$ledgerId","purchaseAmount":{"$sum":"$netAmount"}}},{"$sort":{"purchaseAmount":-1}},{"$limit":10},{"$project":{"_id":0,"supplierId":"$_id","purchaseAmount":1}}]""",
-            Ent.Rows(new() { ["supplierId"] = Ent.SupA, ["purchaseAmount"] = 18500.0 }, new() { ["supplierId"] = Ent.SupB, ["purchaseAmount"] = 9200.0 }));
+            Ent.Rows(new JsonObject { ["supplierId"] = Ent.SupA, ["purchaseAmount"] = 18500.0 }, new() { ["supplierId"] = Ent.SupB, ["purchaseAmount"] = 9200.0 }));
 
         Assert.Equal(new[] { "supplierName", "purchaseAmount" }, r.Result.Columns);         // chart: Purchase Amount by Supplier
         Assert.Equal("ABC Trading", Ent.S(r.Result.Rows[0], "supplierName"));
@@ -101,7 +101,7 @@ public class EntityResolutionTests
     public async Task Top_customers_by_sales_show_customer_names()
     {
         var r = await Resolve("Sale", """[{"$group":{"_id":"$ledgerId","sales":{"$sum":"$netAmount"}}},{"$sort":{"sales":-1}}]""",
-            Ent.Rows(new() { ["_id"] = Ent.CusB, ["sales"] = 900.0 }, new() { ["_id"] = Ent.CusA, ["sales"] = 400.0 }));
+            Ent.Rows(new JsonObject { ["_id"] = Ent.CusB, ["sales"] = 900.0 }, new() { ["_id"] = Ent.CusA, ["sales"] = 400.0 }));
         Assert.Equal(new[] { "customerName", "sales" }, r.Result.Columns);
         Assert.Equal("Muscat Mart", Ent.S(r.Result.Rows[0], "customerName"));
         Assert.Equal(Ent.CusB, Ent.S(r.Result.Rows[0], "_id"));
@@ -112,7 +112,7 @@ public class EntityResolutionTests
     {
         var r = await Resolve("AccountVoucher",
             """[{"$match":{"$or":[{"groupId":15},{"parentGroupId":15}]}},{"$group":{"_id":"$ledgerId","debit":{"$sum":"$debit"}}}]""",
-            Ent.Rows(new() { ["_id"] = Ent.CusA, ["debit"] = 50.0 }));
+            Ent.Rows(new JsonObject { ["_id"] = Ent.CusA, ["debit"] = 50.0 }));
         Assert.Equal("customerName", r.Result.Columns[0]);
         Assert.Equal("Al Noor Stores", Ent.S(r.Result.Rows[0], "customerName"));
     }
@@ -121,7 +121,7 @@ public class EntityResolutionTests
     public async Task Purchases_by_supplier_with_a_compound_group_key_are_traced_to_the_supplier()
     {
         var r = await Resolve("Purchase", """[{"$group":{"_id":{"supplier":"$ledgerId","month":{"$month":"$purchaseDate"}},"amount":{"$sum":"$netAmount"}}}]""",
-            Ent.Rows(new() { ["supplier"] = Ent.SupB, ["month"] = 9, ["amount"] = 10.0 }));
+            Ent.Rows(new JsonObject { ["supplier"] = Ent.SupB, ["month"] = 9, ["amount"] = 10.0 }));
         Assert.Equal(new[] { "supplierName", "month", "amount" }, r.Result.Columns);
         Assert.Equal("Gulf Supplies", Ent.S(r.Result.Rows[0], "supplierName"));
     }
@@ -130,7 +130,7 @@ public class EntityResolutionTests
     public async Task Stock_by_product_and_item_wise_stock_show_item_names()
     {
         var r = await Resolve("StockMaster", """[{"$group":{"_id":"$itemId","quantity":{"$sum":"$stockIn"}}},{"$project":{"_id":0,"itemId":"$_id","quantity":1}}]""",
-            Ent.Rows(new() { ["itemId"] = Ent.ItemA, ["quantity"] = 12.0 }, new() { ["itemId"] = Ent.ItemB, ["quantity"] = 3.0 }));
+            Ent.Rows(new JsonObject { ["itemId"] = Ent.ItemA, ["quantity"] = 12.0 }, new() { ["itemId"] = Ent.ItemB, ["quantity"] = 3.0 }));
         Assert.Equal(new[] { "itemName", "quantity" }, r.Result.Columns);
         Assert.Equal("Rice 5kg", Ent.S(r.Result.Rows[0], "itemName"));
         Assert.Equal("Sugar 1kg", Ent.S(r.Result.Rows[1], "itemName"));
@@ -140,7 +140,7 @@ public class EntityResolutionTests
     public async Task Stock_by_warehouse_names_warehouses_and_reports_orphans_and_empty_ids_safely()
     {
         var r = await Resolve("StockMaster", """[{"$group":{"_id":"$stockLocationId","quantity":{"$sum":"$stockIn"}}}]""",
-            Ent.Rows(new() { ["_id"] = Ent.WhMain, ["quantity"] = 10.0 }, new() { ["_id"] = "0", ["quantity"] = 2.0 }, new() { ["_id"] = Ent.WhGone, ["quantity"] = 1.0 }));
+            Ent.Rows(new JsonObject { ["_id"] = Ent.WhMain, ["quantity"] = 10.0 }, new() { ["_id"] = "0", ["quantity"] = 2.0 }, new() { ["_id"] = Ent.WhGone, ["quantity"] = 1.0 }));
         Assert.Equal("warehouseName", r.Result.Columns[0]);
         Assert.Equal("Main Store", Ent.S(r.Result.Rows[0], "warehouseName"));
         Assert.Equal("No warehouse", Ent.S(r.Result.Rows[1], "warehouseName"));
@@ -157,11 +157,11 @@ public class EntityResolutionTests
     public async Task Outstanding_by_customer_and_by_supplier_use_the_invoice_party()
     {
         var customers = await Resolve("Sale", """[{"$match":{"balanceAmount":{"$ne":0}}},{"$group":{"_id":"$ledgerId","outstanding":{"$sum":"$balanceAmount"}}}]""",
-            Ent.Rows(new() { ["_id"] = Ent.CusA, ["outstanding"] = 75.5 }));
+            Ent.Rows(new JsonObject { ["_id"] = Ent.CusA, ["outstanding"] = 75.5 }));
         Assert.Equal("Al Noor Stores", Ent.S(customers.Result.Rows[0], "customerName"));
 
         var suppliers = await Resolve("Purchase", """[{"$match":{"balanceAmount":{"$ne":0}}},{"$group":{"_id":"$ledgerId","outstanding":{"$sum":"$balanceAmount"}}}]""",
-            Ent.Rows(new() { ["_id"] = Ent.SupA, ["outstanding"] = 120.0 }));
+            Ent.Rows(new JsonObject { ["_id"] = Ent.SupA, ["outstanding"] = 120.0 }));
         Assert.Equal("ABC Trading", Ent.S(suppliers.Result.Rows[0], "supplierName"));
     }
 
@@ -169,7 +169,7 @@ public class EntityResolutionTests
     public async Task Sales_by_salesman_show_the_employee_name()
     {
         var r = await Resolve("Sale", """[{"$group":{"_id":"$employeeId","sales":{"$sum":"$netAmount"}}}]""",
-            Ent.Rows(new() { ["_id"] = Ent.EmpA, ["sales"] = 100.0 }));
+            Ent.Rows(new JsonObject { ["_id"] = Ent.EmpA, ["sales"] = 100.0 }));
         Assert.Equal(new[] { "salesmanName", "sales" }, r.Result.Columns);
         Assert.Equal("Rahul", Ent.S(r.Result.Rows[0], "salesmanName"));
         Assert.Equal("Employee.employeeName", r.Diagnostics.Single().Master);
@@ -179,7 +179,7 @@ public class EntityResolutionTests
     public async Task Expenses_by_ledger_show_ledger_names()
     {
         var r = await Resolve("AccountVoucher", """[{"$match":{"groupId":{"$in":[9,11]}}},{"$group":{"_id":"$ledgerId","expense":{"$sum":"$debit"}}}]""",
-            Ent.Rows(new() { ["_id"] = Ent.LedRent, ["expense"] = 500.0 }, new() { ["_id"] = Ent.LedPower, ["expense"] = 80.0 }));
+            Ent.Rows(new JsonObject { ["_id"] = Ent.LedRent, ["expense"] = 500.0 }, new() { ["_id"] = Ent.LedPower, ["expense"] = 80.0 }));
         Assert.Equal(new[] { "ledgerName", "expense" }, r.Result.Columns);
         Assert.Equal("Rent", Ent.S(r.Result.Rows[0], "ledgerName"));
     }
@@ -189,12 +189,12 @@ public class EntityResolutionTests
     {
         const string head = """[{"$match":{"transactionType":"SALE"}},{"$addFields":{"itemObj":{"$convert":{"input":"$itemId","to":"objectId","onError":null,"onNull":null}}}},{"$lookup":{"from":"Item","localField":"itemObj","foreignField":"_id","as":"item"}},{"$unwind":"$item"},""";
         var byCategory = await Resolve("StockMaster", head + """{"$group":{"_id":"$item.categoryId","sold":{"$sum":"$stockOut"}}}]""",
-            Ent.Rows(new() { ["_id"] = Ent.CatA, ["sold"] = 7.0 }));
+            Ent.Rows(new JsonObject { ["_id"] = Ent.CatA, ["sold"] = 7.0 }));
         Assert.Equal("Groceries", Ent.S(byCategory.Result.Rows[0], "categoryName"));
         Assert.Equal("Item.categoryId", byCategory.Diagnostics.Single().Source);
 
         var byBrand = await Resolve("StockMaster", head + """{"$group":{"_id":"$item.manufactureId","sold":{"$sum":"$stockOut"}}}]""",
-            Ent.Rows(new() { ["_id"] = Ent.BrandA, ["sold"] = 4.0 }, new() { ["_id"] = "0", ["sold"] = 1.0 }));
+            Ent.Rows(new JsonObject { ["_id"] = Ent.BrandA, ["sold"] = 4.0 }, new() { ["_id"] = "0", ["sold"] = 1.0 }));
         Assert.Equal(new[] { "brandName", "sold" }, byBrand.Result.Columns);
         Assert.Equal("Tilda", Ent.S(byBrand.Result.Rows[0], "brandName"));
         Assert.Equal("No brand", Ent.S(byBrand.Result.Rows[1], "brandName"));
@@ -204,7 +204,7 @@ public class EntityResolutionTests
     public async Task Branch_wise_sales_show_branch_names()
     {
         var r = await Resolve("Sale", """[{"$group":{"_id":"$branchId","sales":{"$sum":"$netAmount"}}}]""",
-            Ent.Rows(new() { ["_id"] = Ent.BranchA, ["sales"] = 10.0 }));
+            Ent.Rows(new JsonObject { ["_id"] = Ent.BranchA, ["sales"] = 10.0 }));
         Assert.Equal("Muscat", Ent.S(r.Result.Rows[0], "branchName"));
     }
 
@@ -212,7 +212,7 @@ public class EntityResolutionTests
     public async Task Account_group_numbers_are_shown_as_group_names()
     {
         var r = await Resolve("AccountVoucher", """[{"$group":{"_id":"$groupId","debit":{"$sum":"$debit"}}}]""",
-            Ent.Rows(new() { ["_id"] = 11, ["debit"] = 5.0 }, new() { ["_id"] = 9, ["debit"] = 3.0 }));
+            Ent.Rows(new JsonObject { ["_id"] = 11, ["debit"] = 5.0 }, new() { ["_id"] = 9, ["debit"] = 3.0 }));
         Assert.Equal(new[] { "groupName", "debit" }, r.Result.Columns);
         Assert.Equal("Indirect Expenses", Ent.S(r.Result.Rows[0], "groupName"));
         Assert.Equal("Direct Expenses", Ent.S(r.Result.Rows[1], "groupName"));
@@ -230,7 +230,7 @@ public class EntityResolutionTests
             }
         };
         var r = await Resolve("Purchase", """[{"$group":{"_id":"$ledgerId","amount":{"$sum":"$netAmount"}}}]""",
-            Ent.Rows(new() { ["_id"] = Ent.SupA, ["amount"] = 1.0 }, new() { ["_id"] = Ent.SupB, ["amount"] = 2.0 }), masters);
+            Ent.Rows(new JsonObject { ["_id"] = Ent.SupA, ["amount"] = 1.0 }, new() { ["_id"] = Ent.SupB, ["amount"] = 2.0 }), masters);
         Assert.Equal("ABC Trading (SUP-01)", Ent.S(r.Result.Rows[0], "supplierName"));
         Assert.Equal("ABC Trading (SUP-02)", Ent.S(r.Result.Rows[1], "supplierName"));
         Assert.Equal(2, r.Diagnostics.Single().DuplicateNames);
@@ -242,7 +242,7 @@ public class EntityResolutionTests
         var (engine, executor) = Msb.Engine();
         executor.Throw = new QueryTimeoutException("slow");
         var r = await engine.ResolveReferencesAsync(Ent.Prepared("Purchase", """[{"$group":{"_id":"$ledgerId","amount":{"$sum":"$netAmount"}}}]"""),
-            Ent.Rows(new() { ["_id"] = Ent.SupA, ["amount"] = 1.0 }), Schema, new AppSettings(), default);
+            Ent.Rows(new JsonObject { ["_id"] = Ent.SupA, ["amount"] = 1.0 }), Schema, new AppSettings(), default);
         Assert.Equal("Unknown supplier", Ent.S(r.Result.Rows[0], "supplierName"));
         var d = r.Diagnostics.Single();
         Assert.True(d.LookupFailed);
@@ -254,7 +254,7 @@ public class EntityResolutionTests
     {
         var (engine, _, calls) = Ent.Engine();
         var r = await engine.ResolveReferencesAsync(Ent.Prepared("Sale", """[{"$group":{"_id":"$userId","count":{"$sum":1}}}]"""),
-            Ent.Rows(new() { ["_id"] = Ent.SupA, ["count"] = 4 }), Schema, new AppSettings(), default);
+            Ent.Rows(new JsonObject { ["_id"] = Ent.SupA, ["count"] = 4 }), Schema, new AppSettings(), default);
         Assert.Equal("Unknown user", Ent.S(r.Result.Rows[0], "userName"));
         Assert.Empty(calls);                                                                 // nothing to look up
         Assert.Contains("identity", r.Diagnostics.Single().Note);
@@ -265,7 +265,7 @@ public class EntityResolutionTests
     {
         var r = await Resolve("Purchase",
             """[{"$group":{"_id":"$ledgerId","supplier":{"$first":"$ledgerName"},"amount":{"$sum":"$netAmount"}}}]""",
-            Ent.Rows(new() { ["_id"] = Ent.SupA, ["supplier"] = "ABC Trading", ["amount"] = 1.0 }));
+            Ent.Rows(new JsonObject { ["_id"] = Ent.SupA, ["supplier"] = "ABC Trading", ["amount"] = 1.0 }));
         Assert.Equal(new[] { "supplier", "amount" }, r.Result.Columns);
         Assert.True(r.Diagnostics.Single().Hidden);
     }
@@ -275,7 +275,7 @@ public class EntityResolutionTests
     {
         // $facet hides the lineage: "salesmanId" still names the entity, verified by the id existing in Employee.
         var r = await Resolve("Sale", """[{"$facet":{"x":[{"$group":{"_id":"$employeeId"}}]}}]""",
-            Ent.Rows(new() { ["salesmanId"] = Ent.EmpA, ["sales"] = 1.0 }));
+            Ent.Rows(new JsonObject { ["salesmanId"] = Ent.EmpA, ["sales"] = 1.0 }));
         Assert.Equal("Rahul", Ent.S(r.Result.Rows[0], "salesmanName"));
         Assert.Equal("column name", r.Diagnostics.Single().Method);
     }

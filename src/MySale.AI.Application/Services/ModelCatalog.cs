@@ -39,6 +39,14 @@ public static class ModelCatalog
         new("deepseek-reasoner", "DeepSeek-R1 (reasoner)", "DeepSeek API reasoning model. Slower; no JSON mode (prompt-enforced).", null, true)
     };
 
+    private static readonly List<CatalogModel> Nvidia = new()
+    {
+        new("meta/llama-3.3-70b-instruct", "Llama 3.3 70B Instruct", "NVIDIA API. Good instruction following and JSON output — good default.", "70B", true),
+        new("nvidia/nemotron-3-super-120b-a12b", "Nemotron 3 Super", "NVIDIA's own model. Stronger reasoning, slower.", "120B"),
+        new("moonshotai/kimi-k2.5", "Kimi K2.5", "Large general model on the NVIDIA API."),
+        new("z-ai/glm-5.1", "GLM 5.1", "Large general model on the NVIDIA API.")
+    };
+
     private static readonly List<CatalogModel> OpenAI = new()
     {
         new("gpt-4o-mini", "GPT-4o mini", "Cheap and fast. Good default for testing.", null, true),
@@ -76,6 +84,7 @@ public static class ModelCatalog
             "openai-compatible" when url.Contains("generativelanguage.googleapis.com") => Gemini,
             "openai-compatible" when url.Contains("anthropic.com") => Anthropic,
             "openai-compatible" when url.Contains("deepseek.com") => DeepSeek,
+            "openai-compatible" when url.Contains("nvidia.com") => Nvidia,
             "openai-compatible" when url.Contains("openai.com") => OpenAI,
             "openai-compatible" when url.Contains(":11434") => Ollama,
             _ => Array.Empty<CatalogModel>()

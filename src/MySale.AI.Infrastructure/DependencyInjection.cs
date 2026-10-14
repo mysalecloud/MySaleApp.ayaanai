@@ -17,6 +17,7 @@ using MySale.AI.Infrastructure.Media;
 using MySale.AI.Infrastructure.Persistence;
 using MySale.AI.Infrastructure.Security;
 using MySale.AI.Infrastructure.Seeding;
+using MySale.AI.Infrastructure.TenantProviders;
 
 namespace MySale.AI.Infrastructure;
 
@@ -227,6 +228,9 @@ public static class DependencyInjection
         // Seeding
         services.AddSingleton<SampleDataSeeder>();
         services.AddScoped<SystemSeeder>();
+
+        // AI Settings → AI Providers & API Keys (company-owned provider keys; additive, see docs/ai/AI_PROVIDER_KEYS.md)
+        services.AddTenantAiProviders(configuration);
         return services;
     }
 }

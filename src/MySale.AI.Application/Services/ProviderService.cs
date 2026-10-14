@@ -58,15 +58,18 @@ public sealed class ProviderService
     private readonly AuditService _audit;
 
     private readonly IProviderOverrides? _overrides;
+    /// <summary>Company-owned providers (AI Settings → AI Providers &amp; API Keys). Null = feature not registered.</summary>
+    private readonly TenantProviders.ITenantProviderResolver? _tenantProviders;
 
     public ProviderService(IProviderRepository repository, IAIProviderFactory factory, ISecretProtector secrets, AuditService audit,
-        IProviderOverrides? overrides = null)
+        IProviderOverrides? overrides = null, TenantProviders.ITenantProviderResolver? tenantProviders = null)
     {
         _repository = repository;
         _factory = factory;
         _secrets = secrets;
         _audit = audit;
         _overrides = overrides;
+        _tenantProviders = tenantProviders;
     }
 
     public IReadOnlyList<ProviderKindInfo> Kinds => _factory.Kinds;
@@ -200,6 +203,14 @@ public sealed class ProviderService
     /// <summary>Selects the provider + model for a chat turn: explicit request → settings default → provider default → first enabled.</summary>
     public async Task<ResolvedProvider> ResolveAsync(string? providerId, string? model, AppSettings settings, CancellationToken ct)
     {
+        // A MySaleBooks company that explicitly chose its own provider (and key) for AYAAN chat uses it. Returns null in
+        // every other case, so the selection below runs exactly as before. An explicit providerId always wins.
+        if (string.IsNullOrWhiteSpace(providerId) && _tenantProviders is not null)
+        {
+            var companyProvider = await _tenantProviders.ResolveAsync(model, settings, ct);
+            if (companyProvider is not null) return companyProvider;
+        }
+
         var all = await LoadWithOverridesAsync(ct);
         ProviderConfig? config;
         var deploymentDefault = string.IsNullOrWhiteSpace(_overrides?.DefaultProviderName)

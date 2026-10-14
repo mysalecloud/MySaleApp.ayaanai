@@ -265,9 +265,15 @@ public sealed partial class QueryEngine
             }
 
             // A column of the result already shows these names (the query looked them up): hide the id only.
-            var existing = columns.FirstOrDefault(c => c != column && names.Count > 0 && rows.All(r =>
-                !(Text(r.TryGetPropertyValue(column, out var iv) ? iv : null) is { } id && names.TryGetValue(id.Trim(), out var n))
-                || string.Equals(Text(r.TryGetPropertyValue(c, out var cv) ? cv : null)?.Trim(), n.Name.Trim(), StringComparison.OrdinalIgnoreCase)));
+            // (Keys read like the labels below: integer group numbers too. At least one row must actually match, so a
+            // numeric column such as an amount is never taken for the name column.)
+            var integerKeys = integerIds.Count > 0;
+            bool ShowsName(JsonObject r, string c) =>
+                CellKey(r.TryGetPropertyValue(column, out var iv) ? iv : null, integerKeys) is { } id && names.TryGetValue(id, out var n)
+                && string.Equals(Text(r.TryGetPropertyValue(c, out var cv) ? cv : null)?.Trim(), n.Name.Trim(), StringComparison.OrdinalIgnoreCase);
+            var existing = columns.FirstOrDefault(c => c != column && names.Count > 0
+                && rows.Any(r => ShowsName(r, c))
+                && rows.All(r => !(CellKey(r.TryGetPropertyValue(column, out var iv) ? iv : null, integerKeys) is { } id && names.ContainsKey(id)) || ShowsName(r, c)));
             if (existing is not null)
             {
                 columns.Remove(column);
@@ -491,6 +497,12 @@ public sealed partial class QueryEngine
     }
 
     private static string? Text(JsonNode? node) => node is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
+
+    /// <summary>Lookup key of a cell: the trimmed text, or (integer keys such as account group numbers) the whole number.</summary>
+    private static string? CellKey(JsonNode? node, bool integerKey)
+        => integerKey && node is JsonValue v && JsonHelpers.TryGetNumber(v, out var d) && d == Math.Floor(d)
+            ? ((long)d).ToString(CultureInfo.InvariantCulture)
+            : Text(node)?.Trim();
 
     private static bool IsIdColumn(List<JsonObject> rows, string column)
         => rows.Select(r => Text(r.TryGetPropertyValue(column, out var v) ? v : null)).Where(t => !string.IsNullOrEmpty(t)).DefaultIfEmpty().All(t => t is not null && IsIdText(t));
